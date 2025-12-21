@@ -11,6 +11,7 @@ import yaml
 from mast3r_slam.global_opt import FactorGraph
 
 from mast3r_slam.config import load_config, config, set_global_config
+from mast3r_slam.device import get_device_manager
 from mast3r_slam.dataloader import Intrinsics, load_dataset
 import mast3r_slam.evaluate as eval
 from mast3r_slam.frame import Mode, SharedKeyframes, SharedStates, create_frame
@@ -144,11 +145,7 @@ def run_backend(cfg, model, states, keyframes, K):
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
-    torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
-    device = "cuda:0"
-    save_frames = False
-    datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
@@ -156,8 +153,20 @@ if __name__ == "__main__":
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Device: cuda:0, cuda:1, mps, cpu (auto-detect if not specified)",
+    )
 
     args = parser.parse_args()
+
+    # Initialize device manager (handles TF32, backend config, etc.)
+    dm = get_device_manager()
+    device = dm.initialize(args.device)
+
+    save_frames = False
+    datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     load_config(args.config)
     print(args.dataset)

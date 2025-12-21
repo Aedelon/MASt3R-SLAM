@@ -8,10 +8,13 @@ from dust3r.utils.image import ImgNorm
 from mast3r.model import AsymmetricMASt3R
 from mast3r_slam.retrieval_database import RetrievalDatabase
 from mast3r_slam.config import config
+from mast3r_slam.device import get_device, get_device_manager
 import mast3r_slam.matching as matching
 
 
-def load_mast3r(path=None, device="cuda"):
+def load_mast3r(path=None, device=None):
+    if device is None:
+        device = get_device()
     weights_path = (
         "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
         if path is None
@@ -21,7 +24,9 @@ def load_mast3r(path=None, device="cuda"):
     return model
 
 
-def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
+def load_retriever(mast3r_model, retriever_path=None, device=None):
+    if device is None:
+        device = get_device()
     retriever_path = (
         "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth"
         if retriever_path is None
@@ -34,7 +39,8 @@ def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
 @torch.inference_mode
 def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
     dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
-    with torch.amp.autocast(enabled=False, device_type="cuda"):
+    dm = get_device_manager()
+    with dm.autocast_context(enabled=False):
         res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
         res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
     return res1, res2

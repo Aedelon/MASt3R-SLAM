@@ -5,9 +5,13 @@ from mast3r.retrieval.model import how_select_local
 
 from asmk import io_helpers
 
+from mast3r_slam.device import get_device
+
 
 class RetrievalDatabase(Retriever):
-    def __init__(self, modelname, backbone=None, device="cuda"):
+    def __init__(self, modelname, backbone=None, device=None):
+        if device is None:
+            device = get_device()
         super().__init__(modelname, backbone, device)
 
         self.ivf_builder = self.asmk.create_ivf_builder()

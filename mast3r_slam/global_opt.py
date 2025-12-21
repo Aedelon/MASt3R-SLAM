@@ -1,6 +1,7 @@
 import lietorch
 import torch
 from mast3r_slam.config import config
+from mast3r_slam.device import get_device
 from mast3r_slam.frame import SharedKeyframes
 from mast3r_slam.geometry import (
     constrain_points_to_ray,
@@ -10,7 +11,9 @@ import mast3r_slam_backends
 
 
 class FactorGraph:
-    def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda"):
+    def __init__(self, model, frames: SharedKeyframes, K=None, device=None):
+        if device is None:
+            device = get_device()
         self.model = model
         self.frames = frames
         self.device = device
