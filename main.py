@@ -4,7 +4,6 @@ import pathlib
 import sys
 import time
 import cv2
-import lietorch
 import torch
 import tqdm
 import yaml
@@ -15,6 +14,7 @@ from mast3r_slam.device import get_device_manager
 from mast3r_slam.dataloader import Intrinsics, load_dataset
 import mast3r_slam.evaluate as eval
 from mast3r_slam.frame import Mode, SharedKeyframes, SharedStates, create_frame
+from mast3r_slam.liegroups import Sim3
 from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
@@ -265,7 +265,7 @@ if __name__ == "__main__":
 
         # get frames last camera pose
         T_WC = (
-            lietorch.Sim3.Identity(1, device=device)
+            Sim3.Identity(1, device=device)
             if i == 0
             else states.get_frame().T_WC
         )

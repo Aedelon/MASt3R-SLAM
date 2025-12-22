@@ -1,11 +1,13 @@
 import dataclasses
 from enum import Enum
 from typing import Optional
-import lietorch
+
 import torch
-from mast3r_slam.mast3r_utils import resize_img
+
 from mast3r_slam.config import config
 from mast3r_slam.device import get_device
+from mast3r_slam.liegroups import Sim3
+from mast3r_slam.mast3r_utils import resize_img
 
 
 class Mode(Enum):
@@ -22,7 +24,7 @@ class Frame:
     img_shape: torch.Tensor
     img_true_shape: torch.Tensor
     uimg: torch.Tensor
-    T_WC: lietorch.Sim3 = lietorch.Sim3.Identity(1)
+    T_WC: Sim3 = Sim3.Identity(1)
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
@@ -151,7 +153,7 @@ class SharedStates:
         self.uimg = torch.zeros(h, w, 3, device="cpu", dtype=dtype).share_memory_()
         self.img_shape = torch.zeros(1, 2, device=device, dtype=torch.int).share_memory_()
         self.img_true_shape = torch.zeros(1, 2, device=device, dtype=torch.int).share_memory_()
-        self.T_WC = lietorch.Sim3.Identity(1, device=device, dtype=dtype).data.share_memory_()
+        self.T_WC = Sim3.Identity(1, device=device, dtype=dtype).data.share_memory_()
         self.X = torch.zeros(h * w, 3, device=device, dtype=dtype).share_memory_()
         self.C = torch.zeros(h * w, 1, device=device, dtype=dtype).share_memory_()
         self.feat = torch.zeros(1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
@@ -179,7 +181,7 @@ class SharedStates:
                 self.img_shape,
                 self.img_true_shape,
                 self.uimg,
-                lietorch.Sim3(self.T_WC),
+                Sim3(self.T_WC),
             )
             frame.X_canon = self.X
             frame.C = self.C
@@ -243,7 +245,7 @@ class SharedKeyframes:
         self.uimg = torch.zeros(buffer, h, w, 3, device="cpu", dtype=dtype).share_memory_()
         self.img_shape = torch.zeros(buffer, 1, 2, device=device, dtype=torch.int).share_memory_()
         self.img_true_shape = torch.zeros(buffer, 1, 2, device=device, dtype=torch.int).share_memory_()
-        self.T_WC = torch.zeros(buffer, 1, lietorch.Sim3.embedded_dim, device=device, dtype=dtype).share_memory_()
+        self.T_WC = torch.zeros(buffer, 1, Sim3.embedded_dim, device=device, dtype=dtype).share_memory_()
         self.X = torch.zeros(buffer, h * w, 3, device=device, dtype=dtype).share_memory_()
         self.C = torch.zeros(buffer, h * w, 1, device=device, dtype=dtype).share_memory_()
         self.N = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
@@ -263,7 +265,7 @@ class SharedKeyframes:
                 self.img_shape[idx],
                 self.img_true_shape[idx],
                 self.uimg[idx],
-                lietorch.Sim3(self.T_WC[idx]),
+                Sim3(self.T_WC[idx]),
             )
             kf.X_canon = self.X[idx]
             kf.C = self.C[idx]

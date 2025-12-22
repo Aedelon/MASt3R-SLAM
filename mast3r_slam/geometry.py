@@ -1,5 +1,6 @@
-import lietorch
 import torch
+
+from mast3r_slam.liegroups import Sim3
 
 
 def skew_sym(x):
@@ -42,7 +43,7 @@ def constrain_points_to_ray(img_size, Xs, K):
     return Xs
 
 
-def act_Sim3(X: lietorch.Sim3, pC: torch.Tensor, jacobian=False):
+def act_Sim3(X: Sim3, pC: torch.Tensor, jacobian=False):
     pW = X.act(pC)
     if not jacobian:
         return pW

@@ -1,8 +1,9 @@
-import lietorch
 import torch
+
 from mast3r_slam.config import config
 from mast3r_slam.device import get_device
 from mast3r_slam.frame import SharedKeyframes
+from mast3r_slam.liegroups import Sim3
 from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
@@ -115,7 +116,7 @@ class FactorGraph:
     def get_poses_points(self, unique_kf_idx):
         kfs = [self.frames[idx] for idx in unique_kf_idx]
         Xs = torch.stack([kf.X_canon for kf in kfs])
-        T_WCs = lietorch.Sim3(torch.stack([kf.T_WC.data for kf in kfs]))
+        T_WCs = Sim3(torch.stack([kf.T_WC.data for kf in kfs]))
 
         Cs = torch.stack([kf.get_average_conf() for kf in kfs])
 

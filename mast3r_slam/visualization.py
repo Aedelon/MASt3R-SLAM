@@ -3,7 +3,6 @@ import weakref
 from pathlib import Path
 
 import imgui
-import lietorch
 import torch
 import moderngl
 import moderngl_window as mglw
@@ -20,6 +19,7 @@ from moderngl_window.timers.clock import Timer
 
 from mast3r_slam.frame import Mode
 from mast3r_slam.geometry import get_pixel_coords
+from mast3r_slam.liegroups import Sim3
 from mast3r_slam.lietorch_utils import as_SE3
 from mast3r_slam.visualization_utils import (
     Frustums,
@@ -175,8 +175,8 @@ class Window(WindowEvents):
                 ii = torch.tensor(self.states.edges_ii, dtype=torch.long)
                 jj = torch.tensor(self.states.edges_jj, dtype=torch.long)
                 if ii.numel() > 0 and jj.numel() > 0:
-                    T_WCi = lietorch.Sim3(self.keyframes.T_WC[ii, 0])
-                    T_WCj = lietorch.Sim3(self.keyframes.T_WC[jj, 0])
+                    T_WCi = Sim3(self.keyframes.T_WC[ii, 0])
+                    T_WCj = Sim3(self.keyframes.T_WC[jj, 0])
             if ii.numel() > 0 and jj.numel() > 0:
                 t_WCi = T_WCi.matrix()[:, :3, 3].cpu().numpy()
                 t_WCj = T_WCj.matrix()[:, :3, 3].cpu().numpy()
