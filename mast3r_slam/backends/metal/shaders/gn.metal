@@ -388,8 +388,8 @@ kernel void ray_align_kernel(
 
         // Jacobian storage
         float Jx[14];
-        float* Ji = &Jx[0];
-        float* Jj = &Jx[7];
+        thread float* Ji = &Jx[0];
+        thread float* Jj = &Jx[7];
 
         // Load pose i for Jacobian transform
         float3 t_i = float3(ti[0], ti[1], ti[2]);
@@ -736,8 +736,8 @@ kernel void calib_proj_kernel(
 
         // Jacobians
         float Jx[14];
-        float* Ji = &Jx[0];
-        float* Jj = &Jx[7];
+        thread float* Ji = &Jx[0];
+        thread float* Jj = &Jx[7];
 
         float3 t_i = float3(ti[0], ti[1], ti[2]);
         float4 q_i = float4(qi[0], qi[1], qi[2], qi[3]);
