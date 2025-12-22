@@ -105,17 +105,10 @@ std::vector<torch::Tensor> iter_proj(
         [encoder setBuffer:conv_buf.buffer offset:conv_buf.offset atIndex:4];
         [encoder setBuffer:params_buf offset:0 atIndex:5];
 
-        // Optimized thread dispatch with aligned threadgroup size
-        NSUInteger threadWidth = pipeline.threadExecutionWidth;  // typically 32
-        NSUInteger maxThreads = pipeline.maxTotalThreadsPerThreadgroup;
-
-        // Align to threadExecutionWidth for optimal SIMD utilization
-        NSUInteger alignedWidth = ((n_points + threadWidth - 1) / threadWidth) * threadWidth;
-        alignedWidth = MIN(alignedWidth, maxThreads);
-        alignedWidth = MAX(alignedWidth, threadWidth);
-
+        // Optimized thread dispatch
+        NSUInteger threadWidth = pipeline.threadExecutionWidth;
         MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
-        MTLSize threadgroup = MTLSizeMake(MIN(alignedWidth, (NSUInteger)n_points), 1, 1);
+        MTLSize threadgroup = MTLSizeMake(MIN(threadWidth, (NSUInteger)n_points), 1, 1);
 
         [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
         [encoder endEncoding];
@@ -213,16 +206,9 @@ std::vector<torch::Tensor> refine_matches(
         [encoder setBuffer:p1_out_buf.buffer offset:p1_out_buf.offset atIndex:3];
         [encoder setBuffer:params_buf offset:0 atIndex:4];
 
-        // Optimized thread dispatch with aligned threadgroup size
         NSUInteger threadWidth = pipeline.threadExecutionWidth;
-        NSUInteger maxThreads = pipeline.maxTotalThreadsPerThreadgroup;
-
-        NSUInteger alignedWidth = ((n_points + threadWidth - 1) / threadWidth) * threadWidth;
-        alignedWidth = MIN(alignedWidth, maxThreads);
-        alignedWidth = MAX(alignedWidth, threadWidth);
-
         MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
-        MTLSize threadgroup = MTLSizeMake(MIN(alignedWidth, (NSUInteger)n_points), 1, 1);
+        MTLSize threadgroup = MTLSizeMake(MIN(threadWidth, (NSUInteger)n_points), 1, 1);
 
         [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
         [encoder endEncoding];
@@ -257,7 +243,7 @@ std::vector<torch::Tensor> iter_proj_and_refine_batched(
     if (!ctx.initialize()) return {};
 
     auto* proj_pipeline = ctx.get_pipeline(pipelines::ITER_PROJ);
-    auto* refine_pipeline = ctx.get_pipeline(pipelines::REFINE_MATCHES);
+    auto* refine_pipeline = ctx.get_pipeline(pipelines::REFINE_FROM_FLOAT);  // Uses float input!
 
     if (!proj_pipeline || !refine_pipeline) {
         TORCH_WARN("Metal batched pipelines not available");
@@ -298,12 +284,7 @@ std::vector<torch::Tensor> iter_proj_and_refine_batched(
             {batch_size, n_points, 2}, torch::kFloat32, use_mps);
         auto [conv_buf, converged] = ctx.prepare_output(
             {batch_size, n_points}, torch::kBool, use_mps);
-
-        // Intermediate buffer for projected positions as int64
-        auto [p1_buf, p1_int] = ctx.prepare_output(
-            {batch_size, n_points, 2}, torch::kInt64, use_mps);
-
-        // Final refined output
+        // Final refined output (refine_from_float reads float directly, no conversion needed)
         auto [p_refined_buf, p_refined] = ctx.prepare_output(
             {batch_size, n_points, 2}, torch::kInt64, use_mps);
 
@@ -340,11 +321,7 @@ std::vector<torch::Tensor> iter_proj_and_refine_batched(
             [encoder endEncoding];
         }
 
-        // ==== Convert float positions to int64 (on GPU) ====
-        // For now, we need to sync and convert on CPU
-        // (A dedicated kernel could optimize this)
-
-        // ==== Kernel 2: refine_matches ====
+        // ==== Kernel 2: refine_matches (from float positions) ====
         {
             struct {
                 int batch_size;
@@ -493,40 +470,8 @@ std::vector<torch::Tensor> refine_matches_batched(
 }
 
 // ============================================================================
-// Gauss-Newton Kernels
+// GN kernels (stubs)
 // ============================================================================
-
-// Parameter structures matching Metal shaders
-struct RayAlignParams {
-    int n_edges;
-    int n_pts_per_frame;
-    float sigma_ray;
-    float sigma_dist;
-    float C_thresh;
-    float Q_thresh;
-};
-
-struct CalibProjParams {
-    int n_edges;
-    int n_pts_per_frame;
-    int height;
-    int width;
-    int pixel_border;
-    float z_eps;
-    float sigma_pixel;
-    float sigma_depth;
-    float C_thresh;
-    float Q_thresh;
-};
-
-struct PoseRetrParams {
-    int n_poses;     // Total number of poses
-    int num_fix;     // Number of fixed poses to skip
-};
-
-// Constants
-constexpr int THREADS_GN = 256;
-constexpr int POSE_DIM = 7;
 
 std::vector<torch::Tensor> gauss_newton_rays(
     torch::Tensor poses, torch::Tensor points, torch::Tensor confidences,
@@ -535,201 +480,8 @@ std::vector<torch::Tensor> gauss_newton_rays(
     float sigma_ray, float sigma_dist, float C_thresh, float Q_thresh,
     int max_iter, float delta_thresh)
 {
-    auto& ctx = MetalContext::instance();
-    if (!ctx.initialize()) return {};
-
-    auto* ray_align_pipeline = ctx.get_pipeline(pipelines::RAY_ALIGN_GN);
-    auto* pose_retr_pipeline = ctx.get_pipeline(pipelines::POSE_RETR);
-
-    if (!ray_align_pipeline || !pose_retr_pipeline) {
-        TORCH_WARN("Metal gauss_newton_rays pipelines not available");
-        return {};
-    }
-
-    @autoreleasepool {
-        // Ensure correct types
-        poses = poses.to(torch::kFloat32).contiguous();
-        points = points.to(torch::kFloat32).contiguous();
-        confidences = confidences.to(torch::kFloat32).contiguous();
-        ii = ii.to(torch::kInt32).contiguous();
-        jj = jj.to(torch::kInt32).contiguous();
-        idx_ii2jj = idx_ii2jj.to(torch::kInt32).contiguous();
-        valid_match = valid_match.to(torch::kBool).contiguous();
-        Q = Q.to(torch::kFloat32).contiguous();
-
-        int num_poses = points.size(0);
-        int num_points = points.size(1);
-        int num_edges = ii.size(0);
-        int num_fix = 1;  // Fix first pose
-
-        bool use_mps = is_mps_tensor(poses);
-
-        // Prepare buffers
-        MetalBuffer poses_buf = ctx.prepare_input(poses, ctx.input_pool());
-        MetalBuffer points_buf = ctx.prepare_input(points, ctx.input_pool());
-        MetalBuffer conf_buf = ctx.prepare_input(confidences, ctx.input_pool());
-        MetalBuffer ii_buf = ctx.prepare_input(ii, ctx.input_pool());
-        MetalBuffer jj_buf = ctx.prepare_input(jj, ctx.input_pool());
-        MetalBuffer idx_buf = ctx.prepare_input(idx_ii2jj, ctx.input_pool());
-        MetalBuffer valid_buf = ctx.prepare_input(valid_match, ctx.input_pool());
-        MetalBuffer Q_buf = ctx.prepare_input(Q, ctx.input_pool());
-
-        // Output buffers for Hessian blocks and gradients
-        // Hs: [4, num_edges, 7, 7] - Hii, Hij^T, Hij, Hjj
-        // gs: [2, num_edges, 7] - gi, gj
-        auto [Hs_buf, Hs] = ctx.prepare_output(
-            {4, num_edges, POSE_DIM, POSE_DIM}, torch::kFloat32, use_mps);
-        auto [gs_buf, gs] = ctx.prepare_output(
-            {2, num_edges, POSE_DIM}, torch::kFloat32, use_mps);
-
-        // Parameters
-        RayAlignParams params = {
-            num_edges, num_points,
-            sigma_ray, sigma_dist,
-            C_thresh, Q_thresh
-        };
-        id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
-
-        // Threadgroup memory size for block reduction
-        size_t shared_mem_size = THREADS_GN * sizeof(float);
-
-        // GN iteration loop
-        torch::Tensor dx;
-        for (int iter = 0; iter < max_iter; iter++) {
-            // Zero output buffers
-            Hs.zero_();
-            gs.zero_();
-
-            // Dispatch ray_align_kernel
-            id<MTLCommandBuffer> cmd_buf = ctx.create_command_buffer();
-            id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
-
-            [encoder setComputePipelineState:ray_align_pipeline];
-            [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
-            [encoder setBuffer:points_buf.buffer offset:points_buf.offset atIndex:1];
-            [encoder setBuffer:conf_buf.buffer offset:conf_buf.offset atIndex:2];
-            [encoder setBuffer:ii_buf.buffer offset:ii_buf.offset atIndex:3];
-            [encoder setBuffer:jj_buf.buffer offset:jj_buf.offset atIndex:4];
-            [encoder setBuffer:idx_buf.buffer offset:idx_buf.offset atIndex:5];
-            [encoder setBuffer:valid_buf.buffer offset:valid_buf.offset atIndex:6];
-            [encoder setBuffer:Q_buf.buffer offset:Q_buf.offset atIndex:7];
-            [encoder setBuffer:Hs_buf.buffer offset:Hs_buf.offset atIndex:8];
-            [encoder setBuffer:gs_buf.buffer offset:gs_buf.offset atIndex:9];
-            [encoder setBuffer:params_buf offset:0 atIndex:10];
-            [encoder setThreadgroupMemoryLength:shared_mem_size atIndex:0];
-
-            MTLSize grid = MTLSizeMake(num_edges, 1, 1);
-            MTLSize threadgroup = MTLSizeMake(THREADS_GN, 1, 1);
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
-            [encoder endEncoding];
-
-            [cmd_buf commit];
-            [cmd_buf waitUntilCompleted];
-
-            // Sync outputs to CPU for sparse solve
-            ctx.finalize_output(Hs_buf, Hs);
-            ctx.finalize_output(gs_buf, gs);
-
-            // Move to CPU for solve
-            torch::Tensor Hs_cpu = Hs.to(torch::kCPU);
-            torch::Tensor gs_cpu = gs.to(torch::kCPU);
-            torch::Tensor ii_cpu = ii.to(torch::kCPU).to(torch::kInt64);
-            torch::Tensor jj_cpu = jj.to(torch::kCPU).to(torch::kInt64);
-
-            // Build sparse system and solve on CPU
-            // Using dense solve for now (sparse would require Eigen)
-            int n_opt = num_poses - num_fix;
-            torch::Tensor H = torch::zeros({n_opt * POSE_DIM, n_opt * POSE_DIM}, torch::kFloat64);
-            torch::Tensor b = torch::zeros({n_opt * POSE_DIM}, torch::kFloat64);
-
-            auto ii_acc = ii_cpu.accessor<int64_t, 1>();
-            auto jj_acc = jj_cpu.accessor<int64_t, 1>();
-
-            // Accumulate sparse blocks into dense matrix
-            for (int e = 0; e < num_edges; e++) {
-                int i = ii_acc[e] - num_fix;
-                int j = jj_acc[e] - num_fix;
-
-                if (i >= 0) {
-                    // Add Hii block
-                    H.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM)
-                     .slice(1, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        Hs_cpu[0][e].to(torch::kFloat64);
-
-                    // Add gi
-                    b.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        gs_cpu[0][e].to(torch::kFloat64);
-                }
-
-                if (j >= 0) {
-                    // Add Hjj block
-                    H.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM)
-                     .slice(1, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        Hs_cpu[3][e].to(torch::kFloat64);
-
-                    // Add gj
-                    b.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        gs_cpu[1][e].to(torch::kFloat64);
-                }
-
-                if (i >= 0 && j >= 0) {
-                    // Add Hij and Hij^T blocks
-                    H.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM)
-                     .slice(1, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        Hs_cpu[1][e].to(torch::kFloat64);
-
-                    H.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM)
-                     .slice(1, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        Hs_cpu[2][e].to(torch::kFloat64);
-                }
-            }
-
-            // Solve: dx = -H^{-1} * b
-            // Add damping for stability
-            float damping = 1e-4f;
-            H.diagonal().add_(damping);
-
-            try {
-                auto result = torch::linalg::solve(H, b.unsqueeze(1));
-                dx = -result.squeeze(1).to(torch::kFloat32).reshape({n_opt, POSE_DIM});
-            } catch (...) {
-                dx = torch::zeros({n_opt, POSE_DIM}, torch::kFloat32);
-            }
-
-            // Check convergence
-            float delta_norm = dx.norm().item<float>();
-            if (delta_norm < delta_thresh) {
-                break;
-            }
-
-            // Apply pose retraction on GPU
-            torch::Tensor dx_gpu = use_mps ? dx.to(torch::kMPS) : dx;
-            MetalBuffer dx_buf = ctx.prepare_input(dx_gpu, ctx.input_pool());
-
-            PoseRetrParams retr_params = {num_poses, num_fix};
-            id<MTLBuffer> retr_params_buf = ctx.create_buffer_with_data(&retr_params, sizeof(retr_params));
-
-            cmd_buf = ctx.create_command_buffer();
-            encoder = [cmd_buf computeCommandEncoder];
-
-            [encoder setComputePipelineState:pose_retr_pipeline];
-            [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
-            [encoder setBuffer:dx_buf.buffer offset:dx_buf.offset atIndex:1];
-            [encoder setBuffer:retr_params_buf offset:0 atIndex:2];
-
-            // Dispatch one thread per non-fixed pose
-            int n_opt_dispatch = num_poses - num_fix;
-            grid = MTLSizeMake((n_opt_dispatch + 255) / 256, 1, 1);
-            threadgroup = MTLSizeMake(256, 1, 1);
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
-            [encoder endEncoding];
-
-            [cmd_buf commit];
-            [cmd_buf waitUntilCompleted];
-        }
-
-        return {dx};
-    }
+    TORCH_WARN("gauss_newton_rays: Metal implementation pending");
+    return {};
 }
 
 std::vector<torch::Tensor> gauss_newton_calib(
@@ -740,181 +492,8 @@ std::vector<torch::Tensor> gauss_newton_calib(
     float sigma_pixel, float sigma_depth, float C_thresh, float Q_thresh,
     int max_iter, float delta_thresh)
 {
-    auto& ctx = MetalContext::instance();
-    if (!ctx.initialize()) return {};
-
-    auto* calib_proj_pipeline = ctx.get_pipeline(pipelines::CALIB_PROJ_GN);
-    auto* pose_retr_pipeline = ctx.get_pipeline(pipelines::POSE_RETR);
-
-    if (!calib_proj_pipeline || !pose_retr_pipeline) {
-        TORCH_WARN("Metal gauss_newton_calib pipelines not available");
-        return {};
-    }
-
-    @autoreleasepool {
-        // Ensure correct types
-        poses = poses.to(torch::kFloat32).contiguous();
-        points = points.to(torch::kFloat32).contiguous();
-        confidences = confidences.to(torch::kFloat32).contiguous();
-        K = K.to(torch::kFloat32).contiguous();
-        ii = ii.to(torch::kInt32).contiguous();
-        jj = jj.to(torch::kInt32).contiguous();
-        idx_ii2jj = idx_ii2jj.to(torch::kInt32).contiguous();
-        valid_match = valid_match.to(torch::kBool).contiguous();
-        Q = Q.to(torch::kFloat32).contiguous();
-
-        int num_poses = points.size(0);
-        int num_points = points.size(1);
-        int num_edges = ii.size(0);
-        int num_fix = 1;
-
-        bool use_mps = is_mps_tensor(poses);
-
-        // Prepare buffers
-        MetalBuffer poses_buf = ctx.prepare_input(poses, ctx.input_pool());
-        MetalBuffer points_buf = ctx.prepare_input(points, ctx.input_pool());
-        MetalBuffer conf_buf = ctx.prepare_input(confidences, ctx.input_pool());
-        MetalBuffer K_buf = ctx.prepare_input(K, ctx.input_pool());
-        MetalBuffer ii_buf = ctx.prepare_input(ii, ctx.input_pool());
-        MetalBuffer jj_buf = ctx.prepare_input(jj, ctx.input_pool());
-        MetalBuffer idx_buf = ctx.prepare_input(idx_ii2jj, ctx.input_pool());
-        MetalBuffer valid_buf = ctx.prepare_input(valid_match, ctx.input_pool());
-        MetalBuffer Q_buf = ctx.prepare_input(Q, ctx.input_pool());
-
-        auto [Hs_buf, Hs] = ctx.prepare_output(
-            {4, num_edges, POSE_DIM, POSE_DIM}, torch::kFloat32, use_mps);
-        auto [gs_buf, gs] = ctx.prepare_output(
-            {2, num_edges, POSE_DIM}, torch::kFloat32, use_mps);
-
-        CalibProjParams params = {
-            num_edges, num_points,
-            height, width, pixel_border, z_eps,
-            sigma_pixel, sigma_depth,
-            C_thresh, Q_thresh
-        };
-        id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
-
-        size_t shared_mem_size = THREADS_GN * sizeof(float);
-
-        torch::Tensor dx;
-        for (int iter = 0; iter < max_iter; iter++) {
-            Hs.zero_();
-            gs.zero_();
-
-            id<MTLCommandBuffer> cmd_buf = ctx.create_command_buffer();
-            id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
-
-            [encoder setComputePipelineState:calib_proj_pipeline];
-            [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
-            [encoder setBuffer:points_buf.buffer offset:points_buf.offset atIndex:1];
-            [encoder setBuffer:conf_buf.buffer offset:conf_buf.offset atIndex:2];
-            [encoder setBuffer:K_buf.buffer offset:K_buf.offset atIndex:3];
-            [encoder setBuffer:ii_buf.buffer offset:ii_buf.offset atIndex:4];
-            [encoder setBuffer:jj_buf.buffer offset:jj_buf.offset atIndex:5];
-            [encoder setBuffer:idx_buf.buffer offset:idx_buf.offset atIndex:6];
-            [encoder setBuffer:valid_buf.buffer offset:valid_buf.offset atIndex:7];
-            [encoder setBuffer:Q_buf.buffer offset:Q_buf.offset atIndex:8];
-            [encoder setBuffer:Hs_buf.buffer offset:Hs_buf.offset atIndex:9];
-            [encoder setBuffer:gs_buf.buffer offset:gs_buf.offset atIndex:10];
-            [encoder setBuffer:params_buf offset:0 atIndex:11];
-            [encoder setThreadgroupMemoryLength:shared_mem_size atIndex:0];
-
-            MTLSize grid = MTLSizeMake(num_edges, 1, 1);
-            MTLSize threadgroup = MTLSizeMake(THREADS_GN, 1, 1);
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
-            [encoder endEncoding];
-
-            [cmd_buf commit];
-            [cmd_buf waitUntilCompleted];
-
-            ctx.finalize_output(Hs_buf, Hs);
-            ctx.finalize_output(gs_buf, gs);
-
-            // CPU solve (same as ray_align)
-            torch::Tensor Hs_cpu = Hs.to(torch::kCPU);
-            torch::Tensor gs_cpu = gs.to(torch::kCPU);
-            torch::Tensor ii_cpu = ii.to(torch::kCPU).to(torch::kInt64);
-            torch::Tensor jj_cpu = jj.to(torch::kCPU).to(torch::kInt64);
-
-            int n_opt = num_poses - num_fix;
-            torch::Tensor H = torch::zeros({n_opt * POSE_DIM, n_opt * POSE_DIM}, torch::kFloat64);
-            torch::Tensor b = torch::zeros({n_opt * POSE_DIM}, torch::kFloat64);
-
-            auto ii_acc = ii_cpu.accessor<int64_t, 1>();
-            auto jj_acc = jj_cpu.accessor<int64_t, 1>();
-
-            for (int e = 0; e < num_edges; e++) {
-                int i = ii_acc[e] - num_fix;
-                int j = jj_acc[e] - num_fix;
-
-                if (i >= 0) {
-                    H.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM)
-                     .slice(1, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        Hs_cpu[0][e].to(torch::kFloat64);
-                    b.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        gs_cpu[0][e].to(torch::kFloat64);
-                }
-
-                if (j >= 0) {
-                    H.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM)
-                     .slice(1, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        Hs_cpu[3][e].to(torch::kFloat64);
-                    b.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        gs_cpu[1][e].to(torch::kFloat64);
-                }
-
-                if (i >= 0 && j >= 0) {
-                    H.slice(0, i * POSE_DIM, (i + 1) * POSE_DIM)
-                     .slice(1, j * POSE_DIM, (j + 1) * POSE_DIM) +=
-                        Hs_cpu[1][e].to(torch::kFloat64);
-                    H.slice(0, j * POSE_DIM, (j + 1) * POSE_DIM)
-                     .slice(1, i * POSE_DIM, (i + 1) * POSE_DIM) +=
-                        Hs_cpu[2][e].to(torch::kFloat64);
-                }
-            }
-
-            float damping = 1e-4f;
-            H.diagonal().add_(damping);
-
-            try {
-                auto result = torch::linalg::solve(H, b.unsqueeze(1));
-                dx = -result.squeeze(1).to(torch::kFloat32).reshape({n_opt, POSE_DIM});
-            } catch (...) {
-                dx = torch::zeros({n_opt, POSE_DIM}, torch::kFloat32);
-            }
-
-            float delta_norm = dx.norm().item<float>();
-            if (delta_norm < delta_thresh) {
-                break;
-            }
-
-            torch::Tensor dx_gpu = use_mps ? dx.to(torch::kMPS) : dx;
-            MetalBuffer dx_buf = ctx.prepare_input(dx_gpu, ctx.input_pool());
-
-            PoseRetrParams retr_params = {num_poses, num_fix};
-            id<MTLBuffer> retr_params_buf = ctx.create_buffer_with_data(&retr_params, sizeof(retr_params));
-
-            cmd_buf = ctx.create_command_buffer();
-            encoder = [cmd_buf computeCommandEncoder];
-
-            [encoder setComputePipelineState:pose_retr_pipeline];
-            [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
-            [encoder setBuffer:dx_buf.buffer offset:dx_buf.offset atIndex:1];
-            [encoder setBuffer:retr_params_buf offset:0 atIndex:2];
-
-            // Dispatch one thread per non-fixed pose
-            int n_opt_dispatch = num_poses - num_fix;
-            grid = MTLSizeMake((n_opt_dispatch + 255) / 256, 1, 1);
-            threadgroup = MTLSizeMake(256, 1, 1);
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
-            [encoder endEncoding];
-
-            [cmd_buf commit];
-            [cmd_buf waitUntilCompleted];
-        }
-
-        return {dx};
-    }
+    TORCH_WARN("gauss_newton_calib: Metal implementation pending");
+    return {};
 }
 
 } // namespace metal_backend

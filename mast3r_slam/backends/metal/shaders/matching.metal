@@ -22,25 +22,6 @@ constant int THREADGROUP_SIZE = 256;
 constant int SIMD_SIZE = 32;
 
 // ============================================================================
-// Function Constants for Shader Specialization
-// These allow compile-time optimization based on runtime parameters
-// ============================================================================
-
-// Descriptor dimension (default 24, can be 16, 32, 48, 64)
-constant int FDIM [[function_constant(0)]];
-constant bool FDIM_IS_24 = !is_function_constant_defined(FDIM) || FDIM == 24;
-constant bool FDIM_IS_16 = is_function_constant_defined(FDIM) && FDIM == 16;
-constant bool FDIM_IS_32 = is_function_constant_defined(FDIM) && FDIM == 32;
-
-// Search radius (default 2)
-constant int SEARCH_RADIUS [[function_constant(1)]];
-constant bool USE_DEFAULT_RADIUS = !is_function_constant_defined(SEARCH_RADIUS);
-
-// Precision mode
-constant bool USE_HALF_PRECISION [[function_constant(2)]];
-constant bool USE_HALF = is_function_constant_defined(USE_HALF_PRECISION) && USE_HALF_PRECISION;
-
-// ============================================================================
 // Helper functions
 // ============================================================================
 
@@ -79,57 +60,30 @@ inline void bilinear_sample_9ch_fast(
     u0 = max(u0, 0);
     v0 = max(v0, 0);
 
-    // Prefetch all 4 corners (36 floats total) - vectorized loads
-    device const float* p00 = data + (v0 * W + u0) * 9;
-    device const float* p01 = data + (v1 * W + u0) * 9;
-    device const float* p10 = data + (v0 * W + u1) * 9;
-    device const float* p11 = data + (v1 * W + u1) * 9;
+    // Prefetch all 4 corners (36 floats total)
+    int idx00 = (v0 * W + u0) * 9;
+    int idx01 = (v1 * W + u0) * 9;
+    int idx10 = (v0 * W + u1) * 9;
+    int idx11 = (v1 * W + u1) * 9;
 
-    // Vectorized load using float3 pointer cast (3x faster than scalar)
-    float3 r00 = *((device const float3*)(p00));
-    float3 r01 = *((device const float3*)(p01));
-    float3 r10 = *((device const float3*)(p10));
-    float3 r11 = *((device const float3*)(p11));
-    ray = w00 * r00 + w01 * r01 + w10 * r10 + w11 * r11;
+    // Vectorized loads using packed_float3 (12 bytes, no padding)
+    // 12 vector loads instead of 36 scalar loads
+    device const packed_float3* p00 = (device const packed_float3*)(data + idx00);
+    device const packed_float3* p01 = (device const packed_float3*)(data + idx01);
+    device const packed_float3* p10 = (device const packed_float3*)(data + idx10);
+    device const packed_float3* p11 = (device const packed_float3*)(data + idx11);
 
-    // Vectorized gradient loads
-    float3 gx00 = *((device const float3*)(p00 + 3));
-    float3 gx01 = *((device const float3*)(p01 + 3));
-    float3 gx10 = *((device const float3*)(p10 + 3));
-    float3 gx11 = *((device const float3*)(p11 + 3));
-    grad_x = w00 * gx00 + w01 * gx01 + w10 * gx10 + w11 * gx11;
+    // Load and interpolate ray (channel 0)
+    ray = w00 * float3(p00[0]) + w01 * float3(p01[0]) +
+          w10 * float3(p10[0]) + w11 * float3(p11[0]);
 
-    float3 gy00 = *((device const float3*)(p00 + 6));
-    float3 gy01 = *((device const float3*)(p01 + 6));
-    float3 gy10 = *((device const float3*)(p10 + 6));
-    float3 gy11 = *((device const float3*)(p11 + 6));
-    grad_y = w00 * gy00 + w01 * gy01 + w10 * gy10 + w11 * gy11;
-}
+    // Load and interpolate grad_x (channel 1)
+    grad_x = w00 * float3(p00[1]) + w01 * float3(p01[1]) +
+             w10 * float3(p10[1]) + w11 * float3(p11[1]);
 
-// ============================================================================
-// Float to Int64 Conversion Kernel (avoids CPU sync in batched ops)
-// ============================================================================
-
-kernel void float_to_int64_kernel(
-    device const float* __restrict input [[buffer(0)]],
-    device int64_t* __restrict output [[buffer(1)]],
-    constant uint& count [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= count) return;
-    output[gid] = int64_t(round(input[gid]));
-}
-
-// Fused iter_proj output to int64 (for batched operations)
-kernel void iter_proj_to_int64_kernel(
-    device const float* __restrict p_float [[buffer(0)]],
-    device int64_t* __restrict p_int64 [[buffer(1)]],
-    constant uint& n_elements [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= n_elements) return;
-    // Round float positions to integer pixel coordinates
-    p_int64[gid] = int64_t(round(p_float[gid]));
+    // Load and interpolate grad_y (channel 2)
+    grad_y = w00 * float3(p00[2]) + w01 * float3(p01[2]) +
+             w10 * float3(p10[2]) + w11 * float3(p11[2]);
 }
 
 // ============================================================================
@@ -261,7 +215,7 @@ inline float simd_dot_24(
     return simd_sum(sum);
 }
 
-// Optimized dot product with float4 vectorization + dot() intrinsic
+// Optimized dot product with loop unrolling
 inline float fast_dot(
     device const float* __restrict a,
     device const float* __restrict b,
@@ -269,26 +223,20 @@ inline float fast_dot(
 ) {
     float sum = 0.0f;
 
-    // Vectorized with float4 and hardware dot() - 4x faster than scalar
+    // Unroll by 8
     int k = 0;
     for (; k + 7 < dim; k += 8) {
-        float4 a0 = *((device const float4*)(a + k));
-        float4 a1 = *((device const float4*)(a + k + 4));
-        float4 b0 = *((device const float4*)(b + k));
-        float4 b1 = *((device const float4*)(b + k + 4));
-
-        sum += dot(a0, b0) + dot(a1, b1);
+        sum += a[k] * b[k];
+        sum += a[k+1] * b[k+1];
+        sum += a[k+2] * b[k+2];
+        sum += a[k+3] * b[k+3];
+        sum += a[k+4] * b[k+4];
+        sum += a[k+5] * b[k+5];
+        sum += a[k+6] * b[k+6];
+        sum += a[k+7] * b[k+7];
     }
 
-    // Handle remainder with float4 if possible
-    if (k + 3 < dim) {
-        float4 a0 = *((device const float4*)(a + k));
-        float4 b0 = *((device const float4*)(b + k));
-        sum += dot(a0, b0);
-        k += 4;
-    }
-
-    // Scalar remainder
+    // Handle remainder
     for (; k < dim; k++) {
         sum += a[k] * b[k];
     }
@@ -361,6 +309,72 @@ kernel void refine_matches_kernel_optimized(
         int rd = radius * d;
 
         // Optimized search pattern: center first, then spiral outward
+        for (int dv = -rd; dv <= rd; dv += d) {
+            for (int du = -rd; du <= rd; du += d) {
+                int64_t u = u0 + du;
+                int64_t v = v0 + dv;
+
+                if (u < 0 || u >= W || v < 0 || v >= H) continue;
+
+                device const float* desc = desc_img + (v * W + u) * F;
+                float score = fast_dot(query, desc, F);
+
+                if (score > max_score) {
+                    max_score = score;
+                    u_best = u;
+                    v_best = v;
+                }
+            }
+        }
+
+        u0 = u_best;
+        v0 = v_best;
+    }
+
+    p1_out[p_idx] = u_best;
+    p1_out[p_idx + 1] = v_best;
+}
+
+// Float input version - accepts float positions from iter_proj (no CPU sync needed)
+kernel void refine_matches_kernel_from_float(
+    device const float* __restrict D11 [[buffer(0)]],
+    device const float* __restrict D21 [[buffer(1)]],
+    device const float* __restrict p1_float [[buffer(2)]],  // Float positions!
+    device int64_t* __restrict p1_out [[buffer(3)]],
+    constant RefineMatchesParams& params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int b = gid.y;
+    int n = gid.x;
+
+    if (b >= params.batch_size || n >= params.n_points) return;
+
+    const int N = params.n_points;
+    const int H = params.H;
+    const int W = params.W;
+    const int F = params.fdim;
+    const int radius = params.radius;
+    const int dilation_max = params.dilation_max;
+
+    // Read float positions and round to int
+    int p_idx = (b * N + n) * 2;
+    int64_t u0 = int64_t(round(p1_float[p_idx]));
+    int64_t v0 = int64_t(round(p1_float[p_idx + 1]));
+
+    // Clamp to valid range
+    u0 = clamp(u0, int64_t(0), int64_t(W - 1));
+    v0 = clamp(v0, int64_t(0), int64_t(H - 1));
+
+    device const float* query = D21 + (b * N + n) * F;
+    device const float* desc_img = D11 + b * H * W * F;
+
+    float max_score = -INFINITY;
+    int64_t u_best = u0;
+    int64_t v_best = v0;
+
+    for (int d = dilation_max; d > 0; d--) {
+        int rd = radius * d;
+
         for (int dv = -rd; dv <= rd; dv += d) {
             for (int du = -rd; du <= rd; du += d) {
                 int64_t u = u0 + du;
@@ -514,28 +528,24 @@ kernel void refine_matches_kernel_simd(
             }
         }
 
-        // SIMD-group reduction using simd_max for score
-        // Then find which lane has the max and broadcast its position
-        float global_max = simd_max(thread_max_score);
+        // SIMD-group reduction using O(1) intrinsics instead of O(log N) loop
+        // Step 1: Find max score across all threads (O(1))
+        float max_score = simd_max(thread_max_score);
 
-        // Find which lane has the max (ballot-like pattern)
-        bool is_max_lane = (thread_max_score == global_max);
-        uint max_lane_idx = simd_min(is_max_lane ? simd_lane : SIMD_SIZE);
+        // Step 2: Find first lane that has the max score
+        // Lanes without max use SIMD_SIZE (invalid), lanes with max use their lane id
+        uint lane_with_max = (thread_max_score == max_score) ? simd_lane : SIMD_SIZE;
+        lane_with_max = simd_min(lane_with_max);  // Get first lane with max (O(1))
 
-        // Broadcast position from the winning lane
-        thread_max_score = global_max;
-        thread_u_best = simd_shuffle(thread_u_best, max_lane_idx);
-        thread_v_best = simd_shuffle(thread_v_best, max_lane_idx);
-
-        // Broadcast best position to all threads in SIMD-group
-        u_center = simd_broadcast_first(thread_u_best);
-        v_center = simd_broadcast_first(thread_v_best);
+        // Step 3: Broadcast coordinates from the winning lane (O(1))
+        u_center = simd_shuffle(thread_u_best, ushort(lane_with_max));
+        v_center = simd_shuffle(thread_v_best, ushort(lane_with_max));
     }
 
-    // Only lane 0 writes result
+    // Only lane 0 writes result (u_center/v_center already have final best)
     if (simd_lane == 0) {
-        p1_out[p_idx] = int64_t(thread_u_best);
-        p1_out[p_idx + 1] = int64_t(thread_v_best);
+        p1_out[p_idx] = int64_t(u_center);
+        p1_out[p_idx + 1] = int64_t(v_center);
     }
 }
 

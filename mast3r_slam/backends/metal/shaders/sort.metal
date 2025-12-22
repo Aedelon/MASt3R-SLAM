@@ -25,7 +25,6 @@ constant uint RADIX_MASK = RADIX_SIZE - 1;  // 0xF
 
 constant uint BLOCK_SIZE = 256;            // Threads per threadgroup
 constant uint ELEMENTS_PER_THREAD = 4;     // Elements processed per thread
-constant uint SIMD_SIZE = 32;              // Apple Silicon SIMD width
 
 // ============================================================================
 // Structures
@@ -84,7 +83,8 @@ kernel void radix_histogram(
 
 // ============================================================================
 // Global Prefix Sum (Scan) Kernel - Kogge-Stone Parallel Algorithm
-// Computes exclusive prefix sum across all block histograms in O(log n)
+// Computes exclusive prefix sum across all block histograms
+// O(log n) parallel steps instead of O(n) sequential
 // ============================================================================
 
 kernel void radix_prefix_sum(
@@ -92,50 +92,45 @@ kernel void radix_prefix_sum(
     device uint* __restrict global_offsets [[buffer(1)]],    // [n_blocks, RADIX_SIZE]
     constant SortParams& params [[buffer(2)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint gid [[thread_position_in_grid]],
+    uint tgid [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     threadgroup uint* shared [[threadgroup(0)]]  // [BLOCK_SIZE]
 ) {
-    // Each thread handles one column (one digit across all blocks)
-    uint digit = gid;
-
+    // Each threadgroup handles one digit
+    // Threads within threadgroup parallelize scan across blocks
+    uint digit = tgid;
     if (digit >= RADIX_SIZE) return;
 
-    const uint n_blocks = params.n_blocks;
+    uint n_blocks = params.n_blocks;
 
-    // For small n_blocks, use SIMD parallel scan
-    if (n_blocks <= SIMD_SIZE) {
-        // Load values into SIMD lanes
-        uint val = 0;
-        if (simd_lane < n_blocks) {
-            val = block_histograms[simd_lane * RADIX_SIZE + digit];
-        }
+    // Phase 1: Load histogram values into shared memory
+    for (uint i = tid; i < n_blocks; i += BLOCK_SIZE) {
+        shared[i] = block_histograms[i * RADIX_SIZE + digit];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Kogge-Stone parallel exclusive prefix sum using SIMD
-        uint exclusive = 0;
-        for (uint offset = 1; offset < SIMD_SIZE; offset *= 2) {
-            uint prev = simd_shuffle_up(val, offset);
-            if (simd_lane >= offset) {
-                val += prev;
+    // Phase 2: Kogge-Stone parallel prefix sum (work-efficient scan)
+    // Each iteration doubles the stride
+    for (uint stride = 1; stride < n_blocks; stride *= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < n_blocks; i += BLOCK_SIZE) {
+            if (i >= stride) {
+                // Read values before barrier to avoid race
+                uint left = shared[i - stride];
+                uint right = shared[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                shared[i] = left + right;
             }
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Convert to exclusive scan
-        exclusive = simd_shuffle_up(val, 1);
-        if (simd_lane == 0) exclusive = 0;
-
-        // Write result
-        if (simd_lane < n_blocks) {
-            global_offsets[simd_lane * RADIX_SIZE + digit] = exclusive;
-        }
-    } else {
-        // Fallback: sequential for large n_blocks (rare case)
-        uint running_sum = 0;
-        for (uint block = 0; block < n_blocks; block++) {
-            uint count = block_histograms[block * RADIX_SIZE + digit];
-            global_offsets[block * RADIX_SIZE + digit] = running_sum;
-            running_sum += count;
-        }
+    // Phase 3: Convert inclusive scan to exclusive scan and write output
+    // exclusive_sum[i] = inclusive_sum[i-1] (with exclusive_sum[0] = 0)
+    for (uint i = tid; i < n_blocks; i += BLOCK_SIZE) {
+        uint exclusive_sum = (i > 0) ? shared[i - 1] : 0;
+        global_offsets[i * RADIX_SIZE + digit] = exclusive_sum;
     }
 }
 

@@ -240,6 +240,13 @@ bool MetalContext::create_pipelines() {
                 [device_ newComputePipelineStateWithFunction:fn error:&error];
         }
 
+        // refine_from_float (accepts float positions from iter_proj)
+        fn = [matching_library_ newFunctionWithName:@"refine_matches_kernel_from_float"];
+        if (fn) {
+            pipelines_[pipelines::REFINE_FROM_FLOAT] =
+                [device_ newComputePipelineStateWithFunction:fn error:&error];
+        }
+
         // refine_half (FP16)
         fn = [matching_library_ newFunctionWithName:@"refine_matches_kernel_half"];
         if (fn) {
@@ -285,13 +292,6 @@ bool MetalContext::create_pipelines() {
                                                     reflection:nil
                                                          error:&error];
         }
-
-        // float_to_int64 (conversion kernel for batched ops)
-        fn = [matching_library_ newFunctionWithName:@"float_to_int64_kernel"];
-        if (fn) {
-            pipelines_[pipelines::FLOAT_TO_INT64] =
-                [device_ newComputePipelineStateWithFunction:fn error:&error];
-        }
     }
 
     if (gn_library_) {
@@ -302,38 +302,11 @@ bool MetalContext::create_pipelines() {
                 [device_ newComputePipelineStateWithFunction:fn error:&error];
         }
 
-        // ray_align_gn (full Gauss-Newton with threadgroup memory)
-        fn = [gn_library_ newFunctionWithName:@"ray_align_kernel"];
+        // ray_align
+        fn = [gn_library_ newFunctionWithName:@"ray_align_residual_kernel"];
         if (fn) {
-            MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
-            desc.computeFunction = fn;
-            desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-            pipelines_[pipelines::RAY_ALIGN_GN] =
-                [device_ newComputePipelineStateWithDescriptor:desc
-                                                       options:0
-                                                    reflection:nil
-                                                         error:&error];
-            if (error) {
-                std::cerr << "[MetalContext] ray_align_kernel: "
-                          << [[error localizedDescription] UTF8String] << std::endl;
-            }
-        }
-
-        // calib_proj_gn (calibrated projection Gauss-Newton)
-        fn = [gn_library_ newFunctionWithName:@"calib_proj_kernel"];
-        if (fn) {
-            MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
-            desc.computeFunction = fn;
-            desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-            pipelines_[pipelines::CALIB_PROJ_GN] =
-                [device_ newComputePipelineStateWithDescriptor:desc
-                                                       options:0
-                                                    reflection:nil
-                                                         error:&error];
-            if (error) {
-                std::cerr << "[MetalContext] calib_proj_kernel: "
-                          << [[error localizedDescription] UTF8String] << std::endl;
-            }
+            pipelines_[pipelines::RAY_ALIGN] =
+                [device_ newComputePipelineStateWithFunction:fn error:&error];
         }
     }
 
@@ -417,8 +390,11 @@ MetalBuffer MetalContext::prepare_input(torch::Tensor& t, BufferPool& pool) {
 
     if (is_mps_tensor(t)) {
         // Zero-copy: use MPS buffer directly
-        // Sync MPS stream first to ensure data is ready
-        sync_mps_stream();
+        // Use commit() instead of synchronize() - non-blocking, just submits commands
+        // Our command buffer will naturally wait for MPS work due to buffer dependency
+        if (torch::mps::is_available()) {
+            torch::mps::commit();  // Submit pending MPS work (non-blocking)
+        }
 
         id<MTLBuffer> buffer = get_mps_buffer(t);
         size_t offset = t.storage_offset() * t.element_size();
@@ -443,8 +419,10 @@ std::pair<MetalBuffer, torch::Tensor> MetalContext::prepare_output(
         auto options = torch::TensorOptions().dtype(dtype).device(torch::kMPS);
         torch::Tensor t = torch::empty(shape, options);
 
-        // Sync to ensure tensor is allocated
-        sync_mps_stream();
+        // Commit pending MPS allocations (non-blocking)
+        if (torch::mps::is_available()) {
+            torch::mps::commit();
+        }
 
         id<MTLBuffer> buffer = get_mps_buffer(t);
         return {MetalBuffer(buffer, true, 0), t};
@@ -461,8 +439,9 @@ std::pair<MetalBuffer, torch::Tensor> MetalContext::prepare_output(
 
 void MetalContext::finalize_output(const MetalBuffer& buf, torch::Tensor& t) {
     if (buf.zero_copy) {
-        // MPS tensor: data is already in place, just sync
-        sync_mps_stream();
+        // MPS tensor: data is already in place
+        // No sync needed - we already waited on our command buffer with waitUntilCompleted
+        // The GPU work is guaranteed complete at this point
     } else {
         // CPU tensor: copy from buffer
         t = t.contiguous();
@@ -476,25 +455,6 @@ void MetalContext::sync_mps_stream() {
     if (torch::mps::is_available()) {
         torch::mps::synchronize();
     }
-}
-
-void MetalContext::commit_mps_stream() {
-    // Lightweight: just commit pending MPS work without waiting
-    // Useful for pipelining when we don't need results immediately
-    if (torch::mps::is_available()) {
-        torch::mps::commit();
-    }
-}
-
-void MetalContext::record_completion_event(id<MTLCommandBuffer> cmd_buf) {
-    // Create shared event on first use
-    if (!mps_sync_event_) {
-        mps_sync_event_ = [device_ newSharedEvent];
-    }
-
-    // Signal event when command buffer completes
-    mps_sync_value_++;
-    [cmd_buf encodeSignalEvent:mps_sync_event_ value:mps_sync_value_];
 }
 
 MetalContext::Stats MetalContext::get_stats() const {

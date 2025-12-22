@@ -159,21 +159,8 @@ public:
     /**
      * Synchronize MPS stream with our Metal command buffer.
      * Call before accessing MPS tensor data.
-     * Uses Event-based sync when possible for reduced overhead.
      */
     void sync_mps_stream();
-
-    /**
-     * Lightweight sync: only ensures previous MPS ops are submitted.
-     * Does NOT wait for completion - use for pipelining.
-     */
-    void commit_mps_stream();
-
-    /**
-     * Record an event after our Metal command buffer completes.
-     * MPS operations will wait for this event.
-     */
-    void record_completion_event(id<MTLCommandBuffer> cmd_buf);
 
     // Stats
     struct Stats {
@@ -216,10 +203,6 @@ private:
 
     // Stats
     mutable size_t command_buffers_created_ = 0;
-
-    // MPS sync event
-    id<MTLSharedEvent> mps_sync_event_ = nil;
-    uint64_t mps_sync_value_ = 0;
 };
 
 // ============================================================================
@@ -317,17 +300,13 @@ private:
 namespace pipelines {
     constexpr const char* ITER_PROJ = "iter_proj";
     constexpr const char* REFINE_MATCHES = "refine_matches";
+    constexpr const char* REFINE_FROM_FLOAT = "refine_from_float"; // Float input (no CPU sync)
     constexpr const char* REFINE_HALF = "refine_half";
     constexpr const char* REFINE_TILED = "refine_tiled";
     constexpr const char* REFINE_SIMD = "refine_simd";           // SIMD-group parallel search
     constexpr const char* REFINE_COOPERATIVE = "refine_cooperative"; // Cooperative loading
     constexpr const char* POSE_RETR = "pose_retr";
-    constexpr const char* RAY_ALIGN = "ray_align";               // Legacy residual-only
-    constexpr const char* RAY_ALIGN_GN = "ray_align_gn";         // Full Gauss-Newton kernel
-    constexpr const char* CALIB_PROJ_GN = "calib_proj_gn";       // Calibrated projection GN
-
-    // Conversion kernels
-    constexpr const char* FLOAT_TO_INT64 = "float_to_int64";
+    constexpr const char* RAY_ALIGN = "ray_align";
 
     // Sorting kernels
     constexpr const char* RADIX_HISTOGRAM = "radix_histogram";
