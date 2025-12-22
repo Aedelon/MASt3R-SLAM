@@ -44,7 +44,8 @@ setup(
         CppExtension(
             "mast3r_slam_metal_backends",
             sources=[
-                "metal_ops_optimized.mm",  # Use optimized version
+                "metal_context.mm",
+                "metal_ops.mm",
                 "bindings.cpp",
             ],
             include_dirs=[ROOT],

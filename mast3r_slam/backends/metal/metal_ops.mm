@@ -1,201 +1,39 @@
 // Copyright Delanoe Pirard / Aedelon. Apache 2.0 License.
 /**
- * Obj-C++ bridge for Metal compute kernels.
- * Handles Metal device initialization, shader compilation, and kernel dispatch.
+ * Metal compute operations using MetalContext singleton.
+ *
+ * Supports two modes:
+ * - MPS tensors: Zero-copy, uses MPS buffer storage directly
+ * - CPU tensors: Copies to/from pooled Metal buffers
  */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include "metal_ops.h"
+#include "metal_context.h"
 #include <iostream>
-#include <string>
 
 namespace metal_backend {
 
-// Global Metal state
-static id<MTLDevice> g_device = nil;
-static id<MTLCommandQueue> g_command_queue = nil;
-static id<MTLLibrary> g_matching_library = nil;
-static id<MTLLibrary> g_gn_library = nil;
-
-// Compute pipelines
-static id<MTLComputePipelineState> g_iter_proj_pipeline = nil;
-static id<MTLComputePipelineState> g_refine_matches_pipeline = nil;
-static id<MTLComputePipelineState> g_pose_retr_pipeline = nil;
-static id<MTLComputePipelineState> g_ray_align_pipeline = nil;
-
-static bool g_initialized = false;
-
 // ============================================================================
-// Initialization
+// Public API
 // ============================================================================
 
 bool initialize() {
-    if (g_initialized) return true;
-
-    @autoreleasepool {
-        // Get default Metal device
-        g_device = MTLCreateSystemDefaultDevice();
-        if (!g_device) {
-            std::cerr << "[Metal] No Metal device found" << std::endl;
-            return false;
-        }
-
-        std::cout << "[Metal] Using device: " << [[g_device name] UTF8String] << std::endl;
-
-        // Create command queue
-        g_command_queue = [g_device newCommandQueue];
-        if (!g_command_queue) {
-            std::cerr << "[Metal] Failed to create command queue" << std::endl;
-            return false;
-        }
-
-        // Find shader directory
-        NSBundle* bundle = [NSBundle mainBundle];
-        NSString* shaderDir = nil;
-
-        // Try different paths for shader files
-        NSArray* searchPaths = @[
-            @"mast3r_slam/backends/metal/shaders",
-            @"backends/metal/shaders",
-            @"shaders"
-        ];
-
-        NSFileManager* fm = [NSFileManager defaultManager];
-        for (NSString* path in searchPaths) {
-            NSString* fullPath = [[[NSBundle mainBundle] bundlePath]
-                                  stringByAppendingPathComponent:path];
-            if ([fm fileExistsAtPath:fullPath]) {
-                shaderDir = fullPath;
-                break;
-            }
-        }
-
-        // If not found, try relative to current directory
-        if (!shaderDir) {
-            char cwd[1024];
-            if (getcwd(cwd, sizeof(cwd))) {
-                for (NSString* path in searchPaths) {
-                    NSString* fullPath = [[NSString stringWithUTF8String:cwd]
-                                          stringByAppendingPathComponent:path];
-                    if ([fm fileExistsAtPath:fullPath]) {
-                        shaderDir = fullPath;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!shaderDir) {
-            std::cerr << "[Metal] Shader directory not found" << std::endl;
-            // Continue anyway - shaders will be compiled at runtime
-        }
-
-        NSError* error = nil;
-
-        // Compile matching shaders
-        NSString* matchingPath = [shaderDir stringByAppendingPathComponent:@"matching.metal"];
-        if ([fm fileExistsAtPath:matchingPath]) {
-            NSString* source = [NSString stringWithContentsOfFile:matchingPath
-                                                         encoding:NSUTF8StringEncoding
-                                                            error:&error];
-            if (source) {
-                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-                options.fastMathEnabled = YES;
-                g_matching_library = [g_device newLibraryWithSource:source options:options error:&error];
-                if (!g_matching_library) {
-                    std::cerr << "[Metal] Failed to compile matching shaders: "
-                              << [[error localizedDescription] UTF8String] << std::endl;
-                }
-            }
-        }
-
-        // Compile GN shaders
-        NSString* gnPath = [shaderDir stringByAppendingPathComponent:@"gn.metal"];
-        if ([fm fileExistsAtPath:gnPath]) {
-            NSString* source = [NSString stringWithContentsOfFile:gnPath
-                                                         encoding:NSUTF8StringEncoding
-                                                            error:&error];
-            if (source) {
-                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-                options.fastMathEnabled = YES;
-                g_gn_library = [g_device newLibraryWithSource:source options:options error:&error];
-                if (!g_gn_library) {
-                    std::cerr << "[Metal] Failed to compile GN shaders: "
-                              << [[error localizedDescription] UTF8String] << std::endl;
-                }
-            }
-        }
-
-        // Create compute pipelines
-        if (g_matching_library) {
-            id<MTLFunction> iter_proj_fn = [g_matching_library newFunctionWithName:@"iter_proj_kernel"];
-            if (iter_proj_fn) {
-                g_iter_proj_pipeline = [g_device newComputePipelineStateWithFunction:iter_proj_fn error:&error];
-            }
-
-            id<MTLFunction> refine_fn = [g_matching_library newFunctionWithName:@"refine_matches_kernel"];
-            if (refine_fn) {
-                g_refine_matches_pipeline = [g_device newComputePipelineStateWithFunction:refine_fn error:&error];
-            }
-        }
-
-        if (g_gn_library) {
-            id<MTLFunction> pose_retr_fn = [g_gn_library newFunctionWithName:@"pose_retr_kernel"];
-            if (pose_retr_fn) {
-                g_pose_retr_pipeline = [g_device newComputePipelineStateWithFunction:pose_retr_fn error:&error];
-            }
-
-            id<MTLFunction> ray_align_fn = [g_gn_library newFunctionWithName:@"ray_align_residual_kernel"];
-            if (ray_align_fn) {
-                g_ray_align_pipeline = [g_device newComputePipelineStateWithFunction:ray_align_fn error:&error];
-            }
-        }
-
-        g_initialized = true;
-        std::cout << "[Metal] Initialization complete" << std::endl;
-        std::cout << "[Metal] Pipelines: iter_proj=" << (g_iter_proj_pipeline ? "OK" : "FAIL")
-                  << ", refine=" << (g_refine_matches_pipeline ? "OK" : "FAIL")
-                  << ", pose_retr=" << (g_pose_retr_pipeline ? "OK" : "FAIL")
-                  << ", ray_align=" << (g_ray_align_pipeline ? "OK" : "FAIL") << std::endl;
-
-        return true;
-    }
+    return MetalContext::instance().initialize();
 }
 
 bool is_available() {
-    if (!g_initialized) {
-        initialize();
+    auto& ctx = MetalContext::instance();
+    if (!ctx.is_initialized()) {
+        ctx.initialize();
     }
-    return g_device != nil && g_iter_proj_pipeline != nil;
+    return ctx.is_available() && ctx.has_pipeline(pipelines::ITER_PROJ);
 }
 
 // ============================================================================
-// Helper: Create Metal buffer from tensor
-// ============================================================================
-
-static id<MTLBuffer> tensor_to_buffer(torch::Tensor t, bool copy_data = true) {
-    t = t.contiguous().to(torch::kCPU);
-    size_t size = t.numel() * t.element_size();
-
-    if (copy_data) {
-        return [g_device newBufferWithBytes:t.data_ptr()
-                                     length:size
-                                    options:MTLResourceStorageModeShared];
-    } else {
-        return [g_device newBufferWithLength:size
-                                     options:MTLResourceStorageModeShared];
-    }
-}
-
-static void buffer_to_tensor(id<MTLBuffer> buffer, torch::Tensor& t) {
-    t = t.contiguous();
-    memcpy(t.data_ptr(), [buffer contents], t.numel() * t.element_size());
-}
-
-// ============================================================================
-// iter_proj implementation
+// iter_proj - with MPS zero-copy support
 // ============================================================================
 
 std::vector<torch::Tensor> iter_proj(
@@ -206,8 +44,12 @@ std::vector<torch::Tensor> iter_proj(
     float lambda_init,
     float cost_thresh)
 {
-    if (!initialize() || !g_iter_proj_pipeline) {
-        TORCH_WARN("Metal iter_proj not available, returning empty");
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    auto* pipeline = ctx.get_pipeline(pipelines::ITER_PROJ);
+    if (!pipeline) {
+        TORCH_WARN("Metal iter_proj pipeline not available");
         return {};
     }
 
@@ -217,23 +59,28 @@ std::vector<torch::Tensor> iter_proj(
         int H = rays_img_with_grad.size(1);
         int W = rays_img_with_grad.size(2);
 
+        // Determine if we should use MPS mode (if any input is MPS)
+        bool use_mps = is_mps_tensor(rays_img_with_grad) ||
+                       is_mps_tensor(pts_3d_norm) ||
+                       is_mps_tensor(p_init);
+
         // Ensure float32
         rays_img_with_grad = rays_img_with_grad.to(torch::kFloat32);
         pts_3d_norm = pts_3d_norm.to(torch::kFloat32);
         p_init = p_init.to(torch::kFloat32);
 
-        // Create output tensors
-        torch::Tensor p_out = torch::zeros({batch_size, n_points, 2}, p_init.options());
-        torch::Tensor converged = torch::zeros({batch_size, n_points}, torch::kBool);
+        // Prepare inputs (zero-copy for MPS, copy for CPU)
+        MetalBuffer rays_buf = ctx.prepare_input(rays_img_with_grad, ctx.input_pool());
+        MetalBuffer pts_buf = ctx.prepare_input(pts_3d_norm, ctx.input_pool());
+        MetalBuffer p_init_buf = ctx.prepare_input(p_init, ctx.input_pool());
 
-        // Create Metal buffers
-        id<MTLBuffer> rays_buf = tensor_to_buffer(rays_img_with_grad);
-        id<MTLBuffer> pts_buf = tensor_to_buffer(pts_3d_norm);
-        id<MTLBuffer> p_init_buf = tensor_to_buffer(p_init);
-        id<MTLBuffer> p_out_buf = tensor_to_buffer(p_out, false);
-        id<MTLBuffer> conv_buf = tensor_to_buffer(converged, false);
+        // Prepare outputs
+        auto [p_out_buf, p_out] = ctx.prepare_output(
+            {batch_size, n_points, 2}, torch::kFloat32, use_mps);
+        auto [conv_buf, converged] = ctx.prepare_output(
+            {batch_size, n_points}, torch::kBool, use_mps);
 
-        // Create params buffer
+        // Params
         struct {
             int batch_size;
             int n_points;
@@ -244,26 +91,31 @@ std::vector<torch::Tensor> iter_proj(
             float cost_thresh;
         } params = {batch_size, n_points, H, W, max_iter, lambda_init, cost_thresh};
 
-        id<MTLBuffer> params_buf = [g_device newBufferWithBytes:&params
-                                                         length:sizeof(params)
-                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
 
-        // Create command buffer and encoder
-        id<MTLCommandBuffer> cmd_buf = [g_command_queue commandBuffer];
+        // Execute
+        id<MTLCommandBuffer> cmd_buf = ctx.create_command_buffer();
         id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
 
-        [encoder setComputePipelineState:g_iter_proj_pipeline];
-        [encoder setBuffer:rays_buf offset:0 atIndex:0];
-        [encoder setBuffer:pts_buf offset:0 atIndex:1];
-        [encoder setBuffer:p_init_buf offset:0 atIndex:2];
-        [encoder setBuffer:p_out_buf offset:0 atIndex:3];
-        [encoder setBuffer:conv_buf offset:0 atIndex:4];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:rays_buf.buffer offset:rays_buf.offset atIndex:0];
+        [encoder setBuffer:pts_buf.buffer offset:pts_buf.offset atIndex:1];
+        [encoder setBuffer:p_init_buf.buffer offset:p_init_buf.offset atIndex:2];
+        [encoder setBuffer:p_out_buf.buffer offset:p_out_buf.offset atIndex:3];
+        [encoder setBuffer:conv_buf.buffer offset:conv_buf.offset atIndex:4];
         [encoder setBuffer:params_buf offset:0 atIndex:5];
 
-        // Dispatch
+        // Optimized thread dispatch with aligned threadgroup size
+        NSUInteger threadWidth = pipeline.threadExecutionWidth;  // typically 32
+        NSUInteger maxThreads = pipeline.maxTotalThreadsPerThreadgroup;
+
+        // Align to threadExecutionWidth for optimal SIMD utilization
+        NSUInteger alignedWidth = ((n_points + threadWidth - 1) / threadWidth) * threadWidth;
+        alignedWidth = MIN(alignedWidth, maxThreads);
+        alignedWidth = MAX(alignedWidth, threadWidth);
+
         MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
-        MTLSize threadgroup = MTLSizeMake(
-            MIN(64, g_iter_proj_pipeline.maxTotalThreadsPerThreadgroup), 1, 1);
+        MTLSize threadgroup = MTLSizeMake(MIN(alignedWidth, (NSUInteger)n_points), 1, 1);
 
         [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
         [encoder endEncoding];
@@ -271,16 +123,16 @@ std::vector<torch::Tensor> iter_proj(
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
 
-        // Copy results back
-        buffer_to_tensor(p_out_buf, p_out);
-        buffer_to_tensor(conv_buf, converged);
+        // Finalize outputs (no-op for MPS, copy for CPU)
+        ctx.finalize_output(p_out_buf, p_out);
+        ctx.finalize_output(conv_buf, converged);
 
         return {p_out, converged};
     }
 }
 
 // ============================================================================
-// refine_matches implementation
+// refine_matches - with MPS zero-copy support
 // ============================================================================
 
 std::vector<torch::Tensor> refine_matches(
@@ -290,8 +142,22 @@ std::vector<torch::Tensor> refine_matches(
     int radius,
     int dilation_max)
 {
-    if (!initialize() || !g_refine_matches_pipeline) {
-        TORCH_WARN("Metal refine_matches not available, returning empty");
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    // Select best pipeline based on data type
+    id<MTLComputePipelineState> pipeline = nullptr;
+    bool use_half = false;
+
+    if (D11.dtype() == torch::kFloat16 && ctx.has_pipeline(pipelines::REFINE_HALF)) {
+        pipeline = ctx.get_pipeline(pipelines::REFINE_HALF);
+        use_half = true;
+    } else {
+        pipeline = ctx.get_pipeline(pipelines::REFINE_MATCHES);
+    }
+
+    if (!pipeline) {
+        TORCH_WARN("Metal refine_matches pipeline not available");
         return {};
     }
 
@@ -302,21 +168,28 @@ std::vector<torch::Tensor> refine_matches(
         int W = D11.size(2);
         int fdim = D11.size(3);
 
-        // Ensure correct types
-        D11 = D11.to(torch::kFloat32);
-        D21 = D21.to(torch::kFloat32);
+        // Determine if we should use MPS mode
+        bool use_mps = is_mps_tensor(D11) || is_mps_tensor(D21) || is_mps_tensor(p1);
+
+        // Convert to appropriate type
+        if (use_half) {
+            D11 = D11.to(torch::kFloat16);
+            D21 = D21.to(torch::kFloat16);
+        } else {
+            D11 = D11.to(torch::kFloat32);
+            D21 = D21.to(torch::kFloat32);
+        }
         p1 = p1.to(torch::kInt64);
 
-        // Create output tensor
-        torch::Tensor p1_out = torch::zeros_like(p1);
+        // Prepare inputs
+        MetalBuffer d11_buf = ctx.prepare_input(D11, ctx.input_pool());
+        MetalBuffer d21_buf = ctx.prepare_input(D21, ctx.input_pool());
+        MetalBuffer p1_buf = ctx.prepare_input(p1, ctx.input_pool());
 
-        // Create Metal buffers
-        id<MTLBuffer> d11_buf = tensor_to_buffer(D11);
-        id<MTLBuffer> d21_buf = tensor_to_buffer(D21);
-        id<MTLBuffer> p1_buf = tensor_to_buffer(p1);
-        id<MTLBuffer> p1_out_buf = tensor_to_buffer(p1_out, false);
+        // Prepare output
+        auto [p1_out_buf, p1_out] = ctx.prepare_output(
+            {batch_size, n_points, 2}, torch::kInt64, use_mps);
 
-        // Create params buffer
         struct {
             int batch_size;
             int n_points;
@@ -327,25 +200,29 @@ std::vector<torch::Tensor> refine_matches(
             int dilation_max;
         } params = {batch_size, n_points, H, W, fdim, radius, dilation_max};
 
-        id<MTLBuffer> params_buf = [g_device newBufferWithBytes:&params
-                                                         length:sizeof(params)
-                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
 
-        // Create command buffer and encoder
-        id<MTLCommandBuffer> cmd_buf = [g_command_queue commandBuffer];
+        // Execute
+        id<MTLCommandBuffer> cmd_buf = ctx.create_command_buffer();
         id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
 
-        [encoder setComputePipelineState:g_refine_matches_pipeline];
-        [encoder setBuffer:d11_buf offset:0 atIndex:0];
-        [encoder setBuffer:d21_buf offset:0 atIndex:1];
-        [encoder setBuffer:p1_buf offset:0 atIndex:2];
-        [encoder setBuffer:p1_out_buf offset:0 atIndex:3];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:d11_buf.buffer offset:d11_buf.offset atIndex:0];
+        [encoder setBuffer:d21_buf.buffer offset:d21_buf.offset atIndex:1];
+        [encoder setBuffer:p1_buf.buffer offset:p1_buf.offset atIndex:2];
+        [encoder setBuffer:p1_out_buf.buffer offset:p1_out_buf.offset atIndex:3];
         [encoder setBuffer:params_buf offset:0 atIndex:4];
 
-        // Dispatch
+        // Optimized thread dispatch with aligned threadgroup size
+        NSUInteger threadWidth = pipeline.threadExecutionWidth;
+        NSUInteger maxThreads = pipeline.maxTotalThreadsPerThreadgroup;
+
+        NSUInteger alignedWidth = ((n_points + threadWidth - 1) / threadWidth) * threadWidth;
+        alignedWidth = MIN(alignedWidth, maxThreads);
+        alignedWidth = MAX(alignedWidth, threadWidth);
+
         MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
-        MTLSize threadgroup = MTLSizeMake(
-            MIN(64, g_refine_matches_pipeline.maxTotalThreadsPerThreadgroup), 1, 1);
+        MTLSize threadgroup = MTLSizeMake(MIN(alignedWidth, (NSUInteger)n_points), 1, 1);
 
         [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
         [encoder endEncoding];
@@ -353,60 +230,291 @@ std::vector<torch::Tensor> refine_matches(
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
 
-        // Copy results back
-        buffer_to_tensor(p1_out_buf, p1_out);
+        // Finalize output
+        ctx.finalize_output(p1_out_buf, p1_out);
 
         return {p1_out};
     }
 }
 
 // ============================================================================
-// Gauss-Newton kernels (stubs for now)
+// Batched Operations - Reduced synchronization overhead
+// ============================================================================
+
+std::vector<torch::Tensor> iter_proj_and_refine_batched(
+    torch::Tensor rays_img_with_grad,
+    torch::Tensor pts_3d_norm,
+    torch::Tensor p_init,
+    int max_iter,
+    float lambda_init,
+    float cost_thresh,
+    torch::Tensor D11,
+    torch::Tensor D21,
+    int radius,
+    int dilation_max)
+{
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    auto* proj_pipeline = ctx.get_pipeline(pipelines::ITER_PROJ);
+    auto* refine_pipeline = ctx.get_pipeline(pipelines::REFINE_MATCHES);
+
+    if (!proj_pipeline || !refine_pipeline) {
+        TORCH_WARN("Metal batched pipelines not available");
+        return {};
+    }
+
+    @autoreleasepool {
+        // Dimensions for iter_proj
+        int batch_size = p_init.size(0);
+        int n_points = p_init.size(1);
+        int H_rays = rays_img_with_grad.size(1);
+        int W_rays = rays_img_with_grad.size(2);
+
+        // Dimensions for refine_matches
+        int H_desc = D11.size(1);
+        int W_desc = D11.size(2);
+        int fdim = D11.size(3);
+
+        // Determine MPS mode
+        bool use_mps = is_mps_tensor(rays_img_with_grad) || is_mps_tensor(D11);
+
+        // Ensure types
+        rays_img_with_grad = rays_img_with_grad.to(torch::kFloat32);
+        pts_3d_norm = pts_3d_norm.to(torch::kFloat32);
+        p_init = p_init.to(torch::kFloat32);
+        D11 = D11.to(torch::kFloat32);
+        D21 = D21.to(torch::kFloat32);
+
+        // Prepare all inputs
+        MetalBuffer rays_buf = ctx.prepare_input(rays_img_with_grad, ctx.input_pool());
+        MetalBuffer pts_buf = ctx.prepare_input(pts_3d_norm, ctx.input_pool());
+        MetalBuffer p_init_buf = ctx.prepare_input(p_init, ctx.input_pool());
+        MetalBuffer d11_buf = ctx.prepare_input(D11, ctx.input_pool());
+        MetalBuffer d21_buf = ctx.prepare_input(D21, ctx.input_pool());
+
+        // Prepare outputs
+        auto [p_proj_buf, p_proj] = ctx.prepare_output(
+            {batch_size, n_points, 2}, torch::kFloat32, use_mps);
+        auto [conv_buf, converged] = ctx.prepare_output(
+            {batch_size, n_points}, torch::kBool, use_mps);
+
+        // Intermediate buffer for projected positions as int64
+        auto [p1_buf, p1_int] = ctx.prepare_output(
+            {batch_size, n_points, 2}, torch::kInt64, use_mps);
+
+        // Final refined output
+        auto [p_refined_buf, p_refined] = ctx.prepare_output(
+            {batch_size, n_points, 2}, torch::kInt64, use_mps);
+
+        // Create single batch for both kernels
+        CommandBatch batch(ctx);
+
+        // ==== Kernel 1: iter_proj ====
+        {
+            struct {
+                int batch_size;
+                int n_points;
+                int H;
+                int W;
+                int max_iter;
+                float lambda_init;
+                float cost_thresh;
+            } params = {batch_size, n_points, H_rays, W_rays, max_iter, lambda_init, cost_thresh};
+
+            id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
+
+            id<MTLComputeCommandEncoder> encoder = batch.add_encoder();
+            [encoder setComputePipelineState:proj_pipeline];
+            [encoder setBuffer:rays_buf.buffer offset:rays_buf.offset atIndex:0];
+            [encoder setBuffer:pts_buf.buffer offset:pts_buf.offset atIndex:1];
+            [encoder setBuffer:p_init_buf.buffer offset:p_init_buf.offset atIndex:2];
+            [encoder setBuffer:p_proj_buf.buffer offset:p_proj_buf.offset atIndex:3];
+            [encoder setBuffer:conv_buf.buffer offset:conv_buf.offset atIndex:4];
+            [encoder setBuffer:params_buf offset:0 atIndex:5];
+
+            NSUInteger threadWidth = proj_pipeline.threadExecutionWidth;
+            MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
+            MTLSize threadgroup = MTLSizeMake(MIN(threadWidth, (NSUInteger)n_points), 1, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [encoder endEncoding];
+        }
+
+        // ==== Convert float positions to int64 (on GPU) ====
+        // For now, we need to sync and convert on CPU
+        // (A dedicated kernel could optimize this)
+
+        // ==== Kernel 2: refine_matches ====
+        {
+            struct {
+                int batch_size;
+                int n_points;
+                int H;
+                int W;
+                int fdim;
+                int radius;
+                int dilation_max;
+            } params = {batch_size, n_points, H_desc, W_desc, fdim, radius, dilation_max};
+
+            id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
+
+            id<MTLComputeCommandEncoder> encoder = batch.add_encoder();
+            [encoder setComputePipelineState:refine_pipeline];
+            [encoder setBuffer:d11_buf.buffer offset:d11_buf.offset atIndex:0];
+            [encoder setBuffer:d21_buf.buffer offset:d21_buf.offset atIndex:1];
+            // Use p_proj as input (rounded internally in shader)
+            [encoder setBuffer:p_proj_buf.buffer offset:p_proj_buf.offset atIndex:2];
+            [encoder setBuffer:p_refined_buf.buffer offset:p_refined_buf.offset atIndex:3];
+            [encoder setBuffer:params_buf offset:0 atIndex:4];
+
+            NSUInteger threadWidth = refine_pipeline.threadExecutionWidth;
+            MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
+            MTLSize threadgroup = MTLSizeMake(MIN(threadWidth, (NSUInteger)n_points), 1, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [encoder endEncoding];
+        }
+
+        // Single commit for both kernels
+        batch.commit_and_wait();
+
+        // Finalize outputs
+        ctx.finalize_output(p_proj_buf, p_proj);
+        ctx.finalize_output(conv_buf, converged);
+        ctx.finalize_output(p_refined_buf, p_refined);
+
+        return {p_proj, converged, p_refined};
+    }
+}
+
+std::vector<torch::Tensor> refine_matches_batched(
+    const std::vector<torch::Tensor>& D11_list,
+    const std::vector<torch::Tensor>& D21_list,
+    const std::vector<torch::Tensor>& p1_list,
+    int radius,
+    int dilation_max)
+{
+    if (D11_list.empty() || D11_list.size() != D21_list.size() ||
+        D11_list.size() != p1_list.size()) {
+        TORCH_WARN("refine_matches_batched: invalid input sizes");
+        return {};
+    }
+
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    auto* pipeline = ctx.get_pipeline(pipelines::REFINE_MATCHES);
+    if (!pipeline) {
+        TORCH_WARN("Metal refine_matches pipeline not available");
+        return {};
+    }
+
+    @autoreleasepool {
+        size_t n_pairs = D11_list.size();
+        std::vector<torch::Tensor> results;
+        results.reserve(n_pairs);
+
+        // Prepare all inputs
+        std::vector<MetalBuffer> d11_bufs, d21_bufs, p1_bufs;
+        std::vector<std::pair<MetalBuffer, torch::Tensor>> outputs;
+
+        d11_bufs.reserve(n_pairs);
+        d21_bufs.reserve(n_pairs);
+        p1_bufs.reserve(n_pairs);
+        outputs.reserve(n_pairs);
+
+        bool use_mps = !D11_list.empty() && is_mps_tensor(D11_list[0]);
+
+        for (size_t i = 0; i < n_pairs; i++) {
+            torch::Tensor D11 = D11_list[i].to(torch::kFloat32);
+            torch::Tensor D21 = D21_list[i].to(torch::kFloat32);
+            torch::Tensor p1 = p1_list[i].to(torch::kInt64);
+
+            d11_bufs.push_back(ctx.prepare_input(D11, ctx.input_pool()));
+            d21_bufs.push_back(ctx.prepare_input(D21, ctx.input_pool()));
+            p1_bufs.push_back(ctx.prepare_input(p1, ctx.input_pool()));
+
+            int batch_size = p1.size(0);
+            int n_points = p1.size(1);
+            outputs.push_back(ctx.prepare_output(
+                {batch_size, n_points, 2}, torch::kInt64, use_mps));
+        }
+
+        // Single batch for all pairs
+        CommandBatch batch(ctx);
+
+        for (size_t i = 0; i < n_pairs; i++) {
+            torch::Tensor D11 = D11_list[i];
+            torch::Tensor p1 = p1_list[i];
+
+            int batch_size = p1.size(0);
+            int n_points = p1.size(1);
+            int H = D11.size(1);
+            int W = D11.size(2);
+            int fdim = D11.size(3);
+
+            struct {
+                int batch_size;
+                int n_points;
+                int H;
+                int W;
+                int fdim;
+                int radius;
+                int dilation_max;
+            } params = {batch_size, n_points, H, W, fdim, radius, dilation_max};
+
+            id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
+
+            id<MTLComputeCommandEncoder> encoder = batch.add_encoder();
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:d11_bufs[i].buffer offset:d11_bufs[i].offset atIndex:0];
+            [encoder setBuffer:d21_bufs[i].buffer offset:d21_bufs[i].offset atIndex:1];
+            [encoder setBuffer:p1_bufs[i].buffer offset:p1_bufs[i].offset atIndex:2];
+            [encoder setBuffer:outputs[i].first.buffer offset:outputs[i].first.offset atIndex:3];
+            [encoder setBuffer:params_buf offset:0 atIndex:4];
+
+            NSUInteger threadWidth = pipeline.threadExecutionWidth;
+            MTLSize grid = MTLSizeMake(n_points, batch_size, 1);
+            MTLSize threadgroup = MTLSizeMake(MIN(threadWidth, (NSUInteger)n_points), 1, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [encoder endEncoding];
+        }
+
+        // Single commit for all kernels
+        batch.commit_and_wait();
+
+        // Finalize all outputs
+        for (size_t i = 0; i < n_pairs; i++) {
+            ctx.finalize_output(outputs[i].first, outputs[i].second);
+            results.push_back(outputs[i].second);
+        }
+
+        return results;
+    }
+}
+
+// ============================================================================
+// GN kernels (stubs)
 // ============================================================================
 
 std::vector<torch::Tensor> gauss_newton_rays(
-    torch::Tensor poses,
-    torch::Tensor points,
-    torch::Tensor confidences,
-    torch::Tensor ii,
-    torch::Tensor jj,
-    torch::Tensor idx_ii2jj,
-    torch::Tensor valid_match,
-    torch::Tensor Q,
-    float sigma_ray,
-    float sigma_dist,
-    float C_thresh,
-    float Q_thresh,
-    int max_iter,
-    float delta_thresh)
+    torch::Tensor poses, torch::Tensor points, torch::Tensor confidences,
+    torch::Tensor ii, torch::Tensor jj, torch::Tensor idx_ii2jj,
+    torch::Tensor valid_match, torch::Tensor Q,
+    float sigma_ray, float sigma_dist, float C_thresh, float Q_thresh,
+    int max_iter, float delta_thresh)
 {
-    // TODO: Full Metal implementation
     TORCH_WARN("gauss_newton_rays: Metal implementation pending");
     return {};
 }
 
 std::vector<torch::Tensor> gauss_newton_calib(
-    torch::Tensor poses,
-    torch::Tensor points,
-    torch::Tensor confidences,
-    torch::Tensor K,
-    torch::Tensor ii,
-    torch::Tensor jj,
-    torch::Tensor idx_ii2jj,
-    torch::Tensor valid_match,
-    torch::Tensor Q,
-    int height,
-    int width,
-    int pixel_border,
-    float z_eps,
-    float sigma_pixel,
-    float sigma_depth,
-    float C_thresh,
-    float Q_thresh,
-    int max_iter,
-    float delta_thresh)
+    torch::Tensor poses, torch::Tensor points, torch::Tensor confidences, torch::Tensor K,
+    torch::Tensor ii, torch::Tensor jj, torch::Tensor idx_ii2jj,
+    torch::Tensor valid_match, torch::Tensor Q,
+    int height, int width, int pixel_border, float z_eps,
+    float sigma_pixel, float sigma_depth, float C_thresh, float Q_thresh,
+    int max_iter, float delta_thresh)
 {
-    // TODO: Full Metal implementation
     TORCH_WARN("gauss_newton_calib: Metal implementation pending");
     return {};
 }

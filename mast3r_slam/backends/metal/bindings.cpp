@@ -32,6 +32,28 @@ PYBIND11_MODULE(mast3r_slam_metal_backends, m) {
           py::arg("radius"),
           py::arg("dilation_max"));
 
+    // Batched operations (reduced synchronization overhead)
+    m.def("iter_proj_and_refine_batched", &metal_backend::iter_proj_and_refine_batched,
+          "Batched iter_proj + refine_matches in single command buffer",
+          py::arg("rays_img_with_grad"),
+          py::arg("pts_3d_norm"),
+          py::arg("p_init"),
+          py::arg("max_iter"),
+          py::arg("lambda_init"),
+          py::arg("cost_thresh"),
+          py::arg("D11"),
+          py::arg("D21"),
+          py::arg("radius"),
+          py::arg("dilation_max"));
+
+    m.def("refine_matches_batched", &metal_backend::refine_matches_batched,
+          "Multiple refine_matches in single command buffer",
+          py::arg("D11_list"),
+          py::arg("D21_list"),
+          py::arg("p1_list"),
+          py::arg("radius"),
+          py::arg("dilation_max"));
+
     // Gauss-Newton kernels
     m.def("gauss_newton_rays", &metal_backend::gauss_newton_rays,
           "Gauss-Newton optimization for ray alignment (Metal)",
