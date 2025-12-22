@@ -45,6 +45,16 @@ def _cpu_available() -> bool:
         return False
 
 
+def _metal_available() -> bool:
+    """Check if Metal backend is available."""
+    try:
+        import mast3r_slam_metal_backends
+
+        return mast3r_slam_metal_backends.is_available()
+    except ImportError:
+        return False
+
+
 def get_backend(force: Optional[str] = None) -> BackendBase:
     """
     Get the compute backend.
@@ -73,6 +83,8 @@ def get_backend(force: Optional[str] = None) -> BackendBase:
     if backend_type is None:
         if dm.is_cuda() and _cuda_available():
             backend_type = "cuda"
+        elif dm.is_mps() and _metal_available():
+            backend_type = "metal"
         elif _cpu_available():
             backend_type = "cpu"
         elif _cuda_available():
@@ -83,9 +95,16 @@ def get_backend(force: Optional[str] = None) -> BackendBase:
                 "CPU backend not available.",
                 stacklevel=2,
             )
+        elif _metal_available():
+            # Fallback to Metal on macOS
+            backend_type = "metal"
+            warnings.warn(
+                "Using Metal backend despite non-MPS device setting.",
+                stacklevel=2,
+            )
         else:
             raise RuntimeError(
-                "No compute backend available. Install CUDA extension or CPU backend."
+                "No compute backend available. Install CUDA, Metal, or CPU backend."
             )
 
     # Create backend instance
@@ -98,7 +117,9 @@ def get_backend(force: Optional[str] = None) -> BackendBase:
 
         _backend = CPUBackend()
     elif backend_type == "metal":
-        raise NotImplementedError("Metal backend not yet implemented")
+        from mast3r_slam.backends.metal import MetalBackend
+
+        _backend = MetalBackend()
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
 
