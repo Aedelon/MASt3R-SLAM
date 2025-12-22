@@ -9,12 +9,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 has_cuda = torch.cuda.is_available()
 
 include_dirs = [
-    os.path.join(ROOT, "mast3r_slam/backend/include"),
+    os.path.join(ROOT, "mast3r_slam/backends/cuda/include"),
     os.path.join(ROOT, "thirdparty/eigen"),
 ]
 
 sources = [
-    "mast3r_slam/backend/src/gn.cpp",
+    "mast3r_slam/backends/cuda/src/gn.cpp",
 ]
 extra_compile_args = {
     "cores": ["j8"],
@@ -24,8 +24,8 @@ extra_compile_args = {
 if has_cuda:
     from torch.utils.cpp_extension import CUDAExtension
 
-    sources.append("mast3r_slam/backend/src/gn_kernels.cu")
-    sources.append("mast3r_slam/backend/src/matching_kernels.cu")
+    sources.append("mast3r_slam/backends/cuda/src/gn_kernels.cu")
+    sources.append("mast3r_slam/backends/cuda/src/matching_kernels.cu")
     extra_compile_args["nvcc"] = [
         "-O3",
         "-gencode=arch=compute_60,code=sm_60",
