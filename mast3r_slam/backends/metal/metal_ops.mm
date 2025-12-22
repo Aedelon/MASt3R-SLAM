@@ -470,7 +470,164 @@ std::vector<torch::Tensor> refine_matches_batched(
 }
 
 // ============================================================================
-// GN kernels (stubs)
+// GN Helper: Assemble and solve linear system using PyTorch MPS
+// Replaces Eigen SparseBlock with pure PyTorch operations
+// ============================================================================
+
+namespace {
+
+// Structure for Gauss-Newton parameters passed to Metal
+struct GNParams {
+    uint32_t num_points;
+    uint32_t num_edges;
+    float sigma_ray;
+    float sigma_dist;
+    float C_thresh;
+    float Q_thresh;
+};
+
+struct CalibParams {
+    uint32_t num_points;
+    uint32_t num_edges;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pixel_border;
+    float z_eps;
+    float sigma_pixel;
+    float sigma_depth;
+    float C_thresh;
+    float Q_thresh;
+};
+
+// Assemble sparse system from Hessian blocks and solve using PyTorch
+// Replaces Eigen SparseBlock with dense solve (faster for small systems on GPU)
+torch::Tensor assemble_and_solve(
+    torch::Tensor Hs,           // [4, num_edges, 7, 7]
+    torch::Tensor gs,           // [2, num_edges, 7]
+    torch::Tensor ii_opt,       // [num_edges] - optimized indices for i
+    torch::Tensor jj_opt,       // [num_edges] - optimized indices for j
+    int num_poses_opt,          // Number of poses to optimize (excluding fixed)
+    float lm_damping = 1e-4f)   // Levenberg-Marquardt damping
+{
+    const int pose_dim = 7;
+    const int num_edges = ii_opt.size(0);
+    auto opts = Hs.options();
+
+    // Create dense Hessian [num_poses_opt * 7, num_poses_opt * 7]
+    int system_size = num_poses_opt * pose_dim;
+    torch::Tensor H = torch::zeros({system_size, system_size}, opts);
+    torch::Tensor b = torch::zeros({system_size}, opts);
+
+    // Hs layout: [Hii, Hij, Hji, Hjj] each [num_edges, 7, 7]
+    torch::Tensor Hii = Hs[0];  // [E, 7, 7]
+    torch::Tensor Hij = Hs[1];  // [E, 7, 7]
+    torch::Tensor Hji = Hs[2];  // [E, 7, 7]
+    torch::Tensor Hjj = Hs[3];  // [E, 7, 7]
+
+    // gs layout: [gi, gj] each [num_edges, 7]
+    torch::Tensor gi = gs[0];   // [E, 7]
+    torch::Tensor gj = gs[1];   // [E, 7]
+
+    // Scatter-add to build system (using index_add for efficiency)
+    auto ii_opt_cpu = ii_opt.to(torch::kCPU).to(torch::kInt64);
+    auto jj_opt_cpu = jj_opt.to(torch::kCPU).to(torch::kInt64);
+    auto ii_acc = ii_opt_cpu.accessor<int64_t, 1>();
+    auto jj_acc = jj_opt_cpu.accessor<int64_t, 1>();
+
+    // Move Hs, gs to CPU for assembly (small data)
+    auto Hii_cpu = Hii.to(torch::kCPU);
+    auto Hij_cpu = Hij.to(torch::kCPU);
+    auto Hji_cpu = Hji.to(torch::kCPU);
+    auto Hjj_cpu = Hjj.to(torch::kCPU);
+    auto gi_cpu = gi.to(torch::kCPU);
+    auto gj_cpu = gj.to(torch::kCPU);
+
+    auto H_cpu = H.to(torch::kCPU);
+    auto b_cpu = b.to(torch::kCPU);
+
+    for (int e = 0; e < num_edges; e++) {
+        int64_t i = ii_acc[e];
+        int64_t j = jj_acc[e];
+
+        // Skip fixed poses (negative indices)
+        if (i >= 0) {
+            int i_start = i * pose_dim;
+            // Add Hii block
+            H_cpu.index({torch::indexing::Slice(i_start, i_start + pose_dim),
+                         torch::indexing::Slice(i_start, i_start + pose_dim)}) += Hii_cpu[e];
+            // Add gradient
+            b_cpu.index({torch::indexing::Slice(i_start, i_start + pose_dim)}) += gi_cpu[e];
+        }
+
+        if (j >= 0) {
+            int j_start = j * pose_dim;
+            // Add Hjj block
+            H_cpu.index({torch::indexing::Slice(j_start, j_start + pose_dim),
+                         torch::indexing::Slice(j_start, j_start + pose_dim)}) += Hjj_cpu[e];
+            // Add gradient
+            b_cpu.index({torch::indexing::Slice(j_start, j_start + pose_dim)}) += gj_cpu[e];
+        }
+
+        if (i >= 0 && j >= 0) {
+            int i_start = i * pose_dim;
+            int j_start = j * pose_dim;
+            // Add off-diagonal blocks (symmetric)
+            H_cpu.index({torch::indexing::Slice(i_start, i_start + pose_dim),
+                         torch::indexing::Slice(j_start, j_start + pose_dim)}) += Hij_cpu[e];
+            H_cpu.index({torch::indexing::Slice(j_start, j_start + pose_dim),
+                         torch::indexing::Slice(i_start, i_start + pose_dim)}) += Hji_cpu[e];
+        }
+    }
+
+    // Add LM damping to diagonal
+    for (int i = 0; i < system_size; i++) {
+        H_cpu[i][i] += lm_damping * H_cpu[i][i] + 1e-6f;
+    }
+
+    // Move to MPS for solve (if available)
+    torch::Device solve_device = torch::kCPU;
+    if (torch::mps::is_available()) {
+        solve_device = torch::kMPS;
+    }
+
+    H = H_cpu.to(solve_device);
+    b = b_cpu.to(solve_device);
+
+    // Solve H * dx = -b using Cholesky
+    torch::Tensor dx;
+    try {
+        // Use Cholesky for symmetric positive definite (ATen API)
+        torch::Tensor L = at::linalg_cholesky(H);
+        dx = at::cholesky_solve(b.unsqueeze(1), L).squeeze(1);
+        dx = -dx;  // dx = -H^{-1} * b
+    } catch (...) {
+        // Fallback to general solve (ATen API)
+        dx = -at::linalg_solve(H, b);
+    }
+
+    // Reshape to [num_poses_opt, 7]
+    return dx.reshape({num_poses_opt, pose_dim});
+}
+
+// Create optimized indices (excluding fixed poses)
+std::pair<torch::Tensor, torch::Tensor> create_opt_indices(
+    torch::Tensor ii, torch::Tensor jj, int num_fix)
+{
+    // Get unique keyframe indices
+    torch::Tensor all_idx = torch::cat({ii, jj});
+    torch::Tensor unique_idx = std::get<0>(torch::_unique(all_idx, true));
+
+    // Create mapping: original index -> optimized index (excluding first num_fix)
+    torch::Tensor ii_opt = torch::searchsorted(unique_idx, ii) - num_fix;
+    torch::Tensor jj_opt = torch::searchsorted(unique_idx, jj) - num_fix;
+
+    return {ii_opt, jj_opt};
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// Gauss-Newton Rays - Metal kernel + PyTorch solve
 // ============================================================================
 
 std::vector<torch::Tensor> gauss_newton_rays(
@@ -480,9 +637,155 @@ std::vector<torch::Tensor> gauss_newton_rays(
     float sigma_ray, float sigma_dist, float C_thresh, float Q_thresh,
     int max_iter, float delta_thresh)
 {
-    TORCH_WARN("gauss_newton_rays: Metal implementation pending");
-    return {};
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    auto* ray_pipeline = ctx.get_pipeline(pipelines::RAY_ALIGN);
+    auto* retr_pipeline = ctx.get_pipeline(pipelines::POSE_RETR);
+
+    if (!ray_pipeline || !retr_pipeline) {
+        TORCH_WARN("gauss_newton_rays: Metal pipelines not available");
+        return {};
+    }
+
+    @autoreleasepool {
+        const int num_edges = ii.size(0);
+        const int num_poses = points.size(0);
+        const int num_points = points.size(1);
+        const int pose_dim = 7;
+        const int num_fix = 1;
+
+        // Determine device
+        bool use_mps = is_mps_tensor(poses);
+        auto opts = poses.options();
+
+        // Ensure types and contiguity
+        poses = poses.to(torch::kFloat32).contiguous();
+        points = points.to(torch::kFloat32).contiguous();
+        confidences = confidences.to(torch::kFloat32).contiguous();
+        ii = ii.to(torch::kInt64).contiguous();
+        jj = jj.to(torch::kInt64).contiguous();
+        idx_ii2jj = idx_ii2jj.to(torch::kInt64).contiguous();
+        valid_match = valid_match.to(torch::kBool).contiguous();
+        Q = Q.to(torch::kFloat32).contiguous();
+
+        // Create optimized indices
+        auto [ii_opt, jj_opt] = create_opt_indices(ii, jj, num_fix);
+        int num_poses_opt = num_poses - num_fix;
+
+        // Allocate Hessian and gradient buffers
+        torch::Tensor Hs = torch::zeros({4, num_edges, pose_dim, pose_dim}, opts);
+        torch::Tensor gs = torch::zeros({2, num_edges, pose_dim}, opts);
+        torch::Tensor dx;
+
+        for (int itr = 0; itr < max_iter; itr++) {
+            // Reset buffers
+            Hs.zero_();
+            gs.zero_();
+
+            // Prepare inputs for Metal kernel
+            MetalBuffer poses_buf = ctx.prepare_input(poses, ctx.input_pool());
+            MetalBuffer points_buf = ctx.prepare_input(points, ctx.input_pool());
+            MetalBuffer conf_buf = ctx.prepare_input(confidences, ctx.input_pool());
+            MetalBuffer ii_buf = ctx.prepare_input(ii, ctx.input_pool());
+            MetalBuffer jj_buf = ctx.prepare_input(jj, ctx.input_pool());
+            MetalBuffer idx_buf = ctx.prepare_input(idx_ii2jj, ctx.input_pool());
+            MetalBuffer valid_buf = ctx.prepare_input(valid_match, ctx.input_pool());
+            MetalBuffer Q_buf = ctx.prepare_input(Q, ctx.input_pool());
+            MetalBuffer Hs_buf = ctx.prepare_input(Hs, ctx.output_pool());
+            MetalBuffer gs_buf = ctx.prepare_input(gs, ctx.output_pool());
+
+            // Params
+            GNParams params = {
+                (uint32_t)num_points,
+                (uint32_t)num_edges,
+                sigma_ray,
+                sigma_dist,
+                C_thresh,
+                Q_thresh
+            };
+            id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
+
+            // Execute ray_align kernel
+            CommandBatch batch(ctx);
+            {
+                id<MTLComputeCommandEncoder> encoder = batch.add_encoder();
+                [encoder setComputePipelineState:ray_pipeline];
+                [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
+                [encoder setBuffer:points_buf.buffer offset:points_buf.offset atIndex:1];
+                [encoder setBuffer:conf_buf.buffer offset:conf_buf.offset atIndex:2];
+                [encoder setBuffer:ii_buf.buffer offset:ii_buf.offset atIndex:3];
+                [encoder setBuffer:jj_buf.buffer offset:jj_buf.offset atIndex:4];
+                [encoder setBuffer:idx_buf.buffer offset:idx_buf.offset atIndex:5];
+                [encoder setBuffer:valid_buf.buffer offset:valid_buf.offset atIndex:6];
+                [encoder setBuffer:Q_buf.buffer offset:Q_buf.offset atIndex:7];
+                [encoder setBuffer:Hs_buf.buffer offset:Hs_buf.offset atIndex:8];
+                [encoder setBuffer:gs_buf.buffer offset:gs_buf.offset atIndex:9];
+                [encoder setBuffer:params_buf offset:0 atIndex:10];
+
+                // Shared memory for reduction
+                [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+
+                // One threadgroup per edge
+                MTLSize grid = MTLSizeMake(256 * num_edges, 1, 1);
+                MTLSize threadgroup = MTLSizeMake(256, 1, 1);
+                [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+                [encoder endEncoding];
+            }
+            batch.commit_and_wait();
+
+            // Finalize Hs, gs
+            ctx.finalize_output(Hs_buf, Hs);
+            ctx.finalize_output(gs_buf, gs);
+
+            // Solve linear system using PyTorch
+            dx = assemble_and_solve(Hs, gs, ii_opt, jj_opt, num_poses_opt);
+
+            // Apply retraction using Metal kernel
+            if (use_mps) {
+                dx = dx.to(torch::kMPS).contiguous();
+            }
+            MetalBuffer dx_buf = ctx.prepare_input(dx, ctx.input_pool());
+
+            uint32_t num_poses_u = (uint32_t)num_poses;
+            uint32_t num_fix_u = (uint32_t)num_fix;
+
+            id<MTLBuffer> num_poses_buf = ctx.create_buffer_with_data(&num_poses_u, sizeof(uint32_t));
+            id<MTLBuffer> num_fix_buf = ctx.create_buffer_with_data(&num_fix_u, sizeof(uint32_t));
+
+            CommandBatch retr_batch(ctx);
+            {
+                id<MTLComputeCommandEncoder> encoder = retr_batch.add_encoder();
+                [encoder setComputePipelineState:retr_pipeline];
+                [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
+                [encoder setBuffer:dx_buf.buffer offset:dx_buf.offset atIndex:1];
+                [encoder setBuffer:num_poses_buf offset:0 atIndex:2];
+                [encoder setBuffer:num_fix_buf offset:0 atIndex:3];
+
+                MTLSize grid = MTLSizeMake(num_poses_opt, 1, 1);
+                MTLSize threadgroup = MTLSizeMake(MIN(64, (NSUInteger)num_poses_opt), 1, 1);
+                [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+                [encoder endEncoding];
+            }
+            retr_batch.commit_and_wait();
+
+            // Update poses
+            ctx.finalize_output(poses_buf, poses);
+
+            // Check convergence
+            float delta_norm = dx.norm().item<float>();
+            if (delta_norm < delta_thresh) {
+                break;
+            }
+        }
+
+        return {dx};
+    }
 }
+
+// ============================================================================
+// Gauss-Newton Calib - Metal kernel + PyTorch solve
+// ============================================================================
 
 std::vector<torch::Tensor> gauss_newton_calib(
     torch::Tensor poses, torch::Tensor points, torch::Tensor confidences, torch::Tensor K,
@@ -492,8 +795,143 @@ std::vector<torch::Tensor> gauss_newton_calib(
     float sigma_pixel, float sigma_depth, float C_thresh, float Q_thresh,
     int max_iter, float delta_thresh)
 {
-    TORCH_WARN("gauss_newton_calib: Metal implementation pending");
-    return {};
+    auto& ctx = MetalContext::instance();
+    if (!ctx.initialize()) return {};
+
+    auto* calib_pipeline = ctx.get_pipeline(pipelines::CALIB_PROJ);
+    auto* retr_pipeline = ctx.get_pipeline(pipelines::POSE_RETR);
+
+    if (!calib_pipeline || !retr_pipeline) {
+        TORCH_WARN("gauss_newton_calib: Metal pipelines not available");
+        return {};
+    }
+
+    @autoreleasepool {
+        const int num_edges = ii.size(0);
+        const int num_poses = points.size(0);
+        const int num_points = points.size(1);
+        const int pose_dim = 7;
+        const int num_fix = 1;
+
+        bool use_mps = is_mps_tensor(poses);
+        auto opts = poses.options();
+
+        // Ensure types
+        poses = poses.to(torch::kFloat32).contiguous();
+        points = points.to(torch::kFloat32).contiguous();
+        confidences = confidences.to(torch::kFloat32).contiguous();
+        K = K.to(torch::kFloat32).contiguous();
+        ii = ii.to(torch::kInt64).contiguous();
+        jj = jj.to(torch::kInt64).contiguous();
+        idx_ii2jj = idx_ii2jj.to(torch::kInt64).contiguous();
+        valid_match = valid_match.to(torch::kBool).contiguous();
+        Q = Q.to(torch::kFloat32).contiguous();
+
+        auto [ii_opt, jj_opt] = create_opt_indices(ii, jj, num_fix);
+        int num_poses_opt = num_poses - num_fix;
+
+        torch::Tensor Hs = torch::zeros({4, num_edges, pose_dim, pose_dim}, opts);
+        torch::Tensor gs = torch::zeros({2, num_edges, pose_dim}, opts);
+        torch::Tensor dx;
+
+        for (int itr = 0; itr < max_iter; itr++) {
+            Hs.zero_();
+            gs.zero_();
+
+            MetalBuffer poses_buf = ctx.prepare_input(poses, ctx.input_pool());
+            MetalBuffer points_buf = ctx.prepare_input(points, ctx.input_pool());
+            MetalBuffer conf_buf = ctx.prepare_input(confidences, ctx.input_pool());
+            MetalBuffer K_buf = ctx.prepare_input(K, ctx.input_pool());
+            MetalBuffer ii_buf = ctx.prepare_input(ii, ctx.input_pool());
+            MetalBuffer jj_buf = ctx.prepare_input(jj, ctx.input_pool());
+            MetalBuffer idx_buf = ctx.prepare_input(idx_ii2jj, ctx.input_pool());
+            MetalBuffer valid_buf = ctx.prepare_input(valid_match, ctx.input_pool());
+            MetalBuffer Q_buf = ctx.prepare_input(Q, ctx.input_pool());
+            MetalBuffer Hs_buf = ctx.prepare_input(Hs, ctx.output_pool());
+            MetalBuffer gs_buf = ctx.prepare_input(gs, ctx.output_pool());
+
+            CalibParams params = {
+                (uint32_t)num_points,
+                (uint32_t)num_edges,
+                (uint32_t)height,
+                (uint32_t)width,
+                (uint32_t)pixel_border,
+                z_eps,
+                sigma_pixel,
+                sigma_depth,
+                C_thresh,
+                Q_thresh
+            };
+            id<MTLBuffer> params_buf = ctx.create_buffer_with_data(&params, sizeof(params));
+
+            CommandBatch batch(ctx);
+            {
+                id<MTLComputeCommandEncoder> encoder = batch.add_encoder();
+                [encoder setComputePipelineState:calib_pipeline];
+                [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
+                [encoder setBuffer:points_buf.buffer offset:points_buf.offset atIndex:1];
+                [encoder setBuffer:conf_buf.buffer offset:conf_buf.offset atIndex:2];
+                [encoder setBuffer:K_buf.buffer offset:K_buf.offset atIndex:3];
+                [encoder setBuffer:ii_buf.buffer offset:ii_buf.offset atIndex:4];
+                [encoder setBuffer:jj_buf.buffer offset:jj_buf.offset atIndex:5];
+                [encoder setBuffer:idx_buf.buffer offset:idx_buf.offset atIndex:6];
+                [encoder setBuffer:valid_buf.buffer offset:valid_buf.offset atIndex:7];
+                [encoder setBuffer:Q_buf.buffer offset:Q_buf.offset atIndex:8];
+                [encoder setBuffer:Hs_buf.buffer offset:Hs_buf.offset atIndex:9];
+                [encoder setBuffer:gs_buf.buffer offset:gs_buf.offset atIndex:10];
+                [encoder setBuffer:params_buf offset:0 atIndex:11];
+
+                [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+
+                MTLSize grid = MTLSizeMake(256 * num_edges, 1, 1);
+                MTLSize threadgroup = MTLSizeMake(256, 1, 1);
+                [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+                [encoder endEncoding];
+            }
+            batch.commit_and_wait();
+
+            ctx.finalize_output(Hs_buf, Hs);
+            ctx.finalize_output(gs_buf, gs);
+
+            dx = assemble_and_solve(Hs, gs, ii_opt, jj_opt, num_poses_opt);
+
+            if (use_mps) {
+                dx = dx.to(torch::kMPS).contiguous();
+            }
+            MetalBuffer dx_buf = ctx.prepare_input(dx, ctx.input_pool());
+
+            uint32_t num_poses_u = (uint32_t)num_poses;
+            uint32_t num_fix_u = (uint32_t)num_fix;
+
+            id<MTLBuffer> num_poses_buf = ctx.create_buffer_with_data(&num_poses_u, sizeof(uint32_t));
+            id<MTLBuffer> num_fix_buf = ctx.create_buffer_with_data(&num_fix_u, sizeof(uint32_t));
+
+            CommandBatch retr_batch(ctx);
+            {
+                id<MTLComputeCommandEncoder> encoder = retr_batch.add_encoder();
+                [encoder setComputePipelineState:retr_pipeline];
+                [encoder setBuffer:poses_buf.buffer offset:poses_buf.offset atIndex:0];
+                [encoder setBuffer:dx_buf.buffer offset:dx_buf.offset atIndex:1];
+                [encoder setBuffer:num_poses_buf offset:0 atIndex:2];
+                [encoder setBuffer:num_fix_buf offset:0 atIndex:3];
+
+                MTLSize grid = MTLSizeMake(num_poses_opt, 1, 1);
+                MTLSize threadgroup = MTLSizeMake(MIN(64, (NSUInteger)num_poses_opt), 1, 1);
+                [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+                [encoder endEncoding];
+            }
+            retr_batch.commit_and_wait();
+
+            ctx.finalize_output(poses_buf, poses);
+
+            float delta_norm = dx.norm().item<float>();
+            if (delta_norm < delta_thresh) {
+                break;
+            }
+        }
+
+        return {dx};
+    }
 }
 
 } // namespace metal_backend

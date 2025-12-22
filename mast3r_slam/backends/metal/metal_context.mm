@@ -185,8 +185,8 @@ bool MetalContext::compile_shaders() {
         }
     }
 
-    // Compile gn.metal
-    NSString* gnPath = [shaderDir stringByAppendingPathComponent:@"gn.metal"];
+    // Compile gauss_newton.metal
+    NSString* gnPath = [shaderDir stringByAppendingPathComponent:@"gauss_newton.metal"];
     if ([fm fileExistsAtPath:gnPath]) {
         NSString* source = [NSString stringWithContentsOfFile:gnPath
                                                      encoding:NSUTF8StringEncoding
@@ -196,7 +196,7 @@ bool MetalContext::compile_shaders() {
                                                 options:options
                                                   error:&error];
             if (!gn_library_ && error) {
-                std::cerr << "[MetalContext] gn.metal: "
+                std::cerr << "[MetalContext] gauss_newton.metal: "
                           << [[error localizedDescription] UTF8String] << std::endl;
             }
         }
@@ -303,9 +303,16 @@ bool MetalContext::create_pipelines() {
         }
 
         // ray_align
-        fn = [gn_library_ newFunctionWithName:@"ray_align_residual_kernel"];
+        fn = [gn_library_ newFunctionWithName:@"ray_align_kernel"];
         if (fn) {
             pipelines_[pipelines::RAY_ALIGN] =
+                [device_ newComputePipelineStateWithFunction:fn error:&error];
+        }
+
+        // calib_proj
+        fn = [gn_library_ newFunctionWithName:@"calib_proj_kernel"];
+        if (fn) {
+            pipelines_[pipelines::CALIB_PROJ] =
                 [device_ newComputePipelineStateWithFunction:fn error:&error];
         }
     }

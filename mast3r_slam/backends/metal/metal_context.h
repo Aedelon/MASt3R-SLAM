@@ -305,8 +305,11 @@ namespace pipelines {
     constexpr const char* REFINE_TILED = "refine_tiled";
     constexpr const char* REFINE_SIMD = "refine_simd";           // SIMD-group parallel search
     constexpr const char* REFINE_COOPERATIVE = "refine_cooperative"; // Cooperative loading
+
+    // Gauss-Newton kernels
     constexpr const char* POSE_RETR = "pose_retr";
     constexpr const char* RAY_ALIGN = "ray_align";
+    constexpr const char* CALIB_PROJ = "calib_proj";
 
     // Sorting kernels
     constexpr const char* RADIX_HISTOGRAM = "radix_histogram";
