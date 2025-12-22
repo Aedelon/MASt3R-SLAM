@@ -302,11 +302,38 @@ bool MetalContext::create_pipelines() {
                 [device_ newComputePipelineStateWithFunction:fn error:&error];
         }
 
-        // ray_align
-        fn = [gn_library_ newFunctionWithName:@"ray_align_residual_kernel"];
+        // ray_align_gn (full Gauss-Newton with threadgroup memory)
+        fn = [gn_library_ newFunctionWithName:@"ray_align_kernel"];
         if (fn) {
-            pipelines_[pipelines::RAY_ALIGN] =
-                [device_ newComputePipelineStateWithFunction:fn error:&error];
+            MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
+            desc.computeFunction = fn;
+            desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            pipelines_[pipelines::RAY_ALIGN_GN] =
+                [device_ newComputePipelineStateWithDescriptor:desc
+                                                       options:0
+                                                    reflection:nil
+                                                         error:&error];
+            if (error) {
+                std::cerr << "[MetalContext] ray_align_kernel: "
+                          << [[error localizedDescription] UTF8String] << std::endl;
+            }
+        }
+
+        // calib_proj_gn (calibrated projection Gauss-Newton)
+        fn = [gn_library_ newFunctionWithName:@"calib_proj_kernel"];
+        if (fn) {
+            MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
+            desc.computeFunction = fn;
+            desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            pipelines_[pipelines::CALIB_PROJ_GN] =
+                [device_ newComputePipelineStateWithDescriptor:desc
+                                                       options:0
+                                                    reflection:nil
+                                                         error:&error];
+            if (error) {
+                std::cerr << "[MetalContext] calib_proj_kernel: "
+                          << [[error localizedDescription] UTF8String] << std::endl;
+            }
         }
     }
 

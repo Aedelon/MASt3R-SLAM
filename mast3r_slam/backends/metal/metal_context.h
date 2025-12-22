@@ -322,7 +322,9 @@ namespace pipelines {
     constexpr const char* REFINE_SIMD = "refine_simd";           // SIMD-group parallel search
     constexpr const char* REFINE_COOPERATIVE = "refine_cooperative"; // Cooperative loading
     constexpr const char* POSE_RETR = "pose_retr";
-    constexpr const char* RAY_ALIGN = "ray_align";
+    constexpr const char* RAY_ALIGN = "ray_align";               // Legacy residual-only
+    constexpr const char* RAY_ALIGN_GN = "ray_align_gn";         // Full Gauss-Newton kernel
+    constexpr const char* CALIB_PROJ_GN = "calib_proj_gn";       // Calibrated projection GN
 
     // Conversion kernels
     constexpr const char* FLOAT_TO_INT64 = "float_to_int64";
