@@ -1,21 +1,106 @@
+# Copyright Delanoe Pirard / Aedelon. Apache 2.0
 [build-system]
-requires = ["setuptools==70.0.0", "torch"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "MAST3R-SLAM"
-version = "0.0.1"
+name = "mlx-mast3r-slam"
+version = "0.1.0"
+description = "Visual SLAM using MASt3R on Apple Silicon with MLX"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Delanoe Pirard", email = "delanoe@aedelon.com"}
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+keywords = ["slam", "visual-slam", "mast3r", "mlx", "apple-silicon", "3d-reconstruction"]
+
 dependencies = [
-    "numpy==1.26.4",
-    "einops",
-    "pyrealsense2",
-    "evo",
-    "natsort",
-    # "torchcodec==0.1",
-    "plyfile",
+    "mlx>=0.20.0",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "pyyaml>=6.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "pyobjc-framework-metal>=12.1",
+    "pyobjc-framework-metalperformanceshaders>=12.1",
 ]
 
+[project.optional-dependencies]
+full = [
+    "opencv-python>=4.8.0",
+    "evo>=1.25.0",  # For trajectory evaluation
+    "plyfile>=1.0.0",  # For PLY export
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+all = [
+    "mlx-mast3r-slam[full,dev]",
+]
+
+[project.scripts]
+mlx-mast3r-slam = "mlx_mast3r_slam.slam:main"
+
+[project.urls]
+Homepage = "https://github.com/Aedelon/MASt3R-SLAM"
+Documentation = "https://github.com/Aedelon/MASt3R-SLAM#readme"
+Repository = "https://github.com/Aedelon/MASt3R-SLAM.git"
+Issues = "https://github.com/Aedelon/MASt3R-SLAM/issues"
+
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["mast3r_slam"]
-namespaces = false
+where = ["src"]
+
+[tool.setuptools.package-data]
+mlx_mast3r_slam = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.isort]
+known-first-party = ["mlx_mast3r_slam"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=mlx_mast3r_slam --cov-report=term-missing"

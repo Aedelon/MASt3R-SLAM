@@ -4,3 +4,9 @@
 [submodule "thirdparty/in3d/thirdparty/pyimgui"]
 	path = thirdparty/in3d/thirdparty/pyimgui
 	url = https://github.com/pyimgui/pyimgui.git
+[submodule "thirdparty/MASt3R-SLAM"]
+	path = thirdparty/MASt3R-SLAM
+	url = https://github.com/rmurai0610/MASt3R-SLAM.git
+[submodule "thirdparty/mlx-mast3r"]
+	path = thirdparty/mlx-mast3r
+	url = https://github.com/Aedelon/mlx-mast3r.git
